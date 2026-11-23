@@ -1,0 +1,689 @@
+"""Выполнение действий на ПК. Всё опасное (удаление, очистка, закрытие всех окон,
+отправка в Telegram, Vision-агент) — только после голосового «да»."""
+import os
+import re
+import time
+import subprocess
+
+import pyautogui
+import kbfix  # noqa: F401 — Ctrl+V/C/N… работают и в русской раскладке
+import pyperclip
+import pygetwindow as gw
+
+import audio
+import gui
+from settings import APP_DICT, DESKTOP_PATH, PROJECT_DIR
+from intents import (_RE_DELETE_FILE, _RE_CLEAR_FOLDER, _RE_MAXIMIZE_FULL, _RE_WINDOW, _RE_HERE,
+                     _RE_EXPLICIT_FOLDER, _FOLDER_KW, _WINDOW_NOISE, _WINDOW_NOISE_PREFIX, _clean_folder_query)
+from winutil import (_force_foreground, _bring_to_front, _focus_new_app, _launch_by_name, _press_win_d,
+                     _press_hotkey, _find_folder, _find_file, _open_path, _send_to_trash, _clear_folder_contents,
+                     count_folder_items, get_active_explorer_path, is_explorer_window, _clear_notepad,
+                     insert_into_notepad, _find_window_by_title, _find_notepad_window,
+                     set_text_if_empty, open_file_in_notepad, _safe_maximize, _close_all_windows, media_key)
+from vision import _smart_find_target, execute_vision_task, read_screen_and_analyze
+from llm import think_llm, generate_code, clean_code, rewrite_message_for_contact, draft_tg_reply
+from library import find_work_in_library, play_library_work, make_work_id
+from telegram_service import TG_SERVICE, _init_telegram_if_needed
+from timers import parse_duration, parse_reminder, format_duration
+from weather import _extract_weather_city, get_weather, parse_weather_day
+from clock import say_now
+from textinput import type_text
+import volume
+from actionctx import ActionContext
+from pathsafe import safe_filename as _safe_filename, is_protected_path, is_clear_forbidden
+
+
+GENERATED_CODE_DIR = os.path.join(PROJECT_DIR, "generated_code")
+
+
+def _save_generated_code(code, task):
+    try:
+        os.makedirs(GENERATED_CODE_DIR, exist_ok=True)
+        slug = make_work_id(re.sub(r"^(?:написать|напиши)\s+(?:программу|код|скрипт)?\s*", "", task or "", flags=re.I))[:30]
+        path = os.path.join(GENERATED_CODE_DIR, f"{time.strftime('%Y%m%d_%H%M%S')}_{slug or 'code'}.py")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(code.rstrip() + "\n")
+        print(f"💾 Код сохранён: {path}")
+        return path
+    except Exception as e:
+        print(f"⚠️ Не смогла сохранить код: {e}")
+        return None
+
+
+def _smart_find(ctx, query, kind):
+    """Поиск «на глаз»: картинка активного окна И распознанный с него текст уходят в облачную нейросеть.
+    Там может быть банк, почта, переписка — поэтому спрашиваем (всегда, если не включено send_screenshots_to_cloud)."""
+    if not ctx.config.get("send_screenshots_to_cloud", False):
+        if not ctx.confirm(f"Не нашла «{query}». Показать активное окно облачной нейросети, чтобы найти? "
+                           f"Картинка и текст окна уйдут в интернет.", force=True):
+            return None
+    return _smart_find_target(query, kind)
+
+
+def _base(p):
+    return os.path.basename(str(p).rstrip("/\\")) or str(p)
+
+
+
+
+# ==================== TELEGRAM ====================
+def _tg_find(contact):
+    dialog, label = TG_SERVICE.find_dialog(contact)
+    if dialog is None:
+        if label:
+            return None, f"Нашла несколько похожих: {', '.join(label)}. Скажи точнее."
+        return None, None
+    return dialog, label
+
+
+def _tg_send(ctx, contact, text, fallback_notepad=False):
+    ok, msg = _init_telegram_if_needed(ctx.config)
+    if not ok:
+        if fallback_notepad:
+            print(f"⚠️ Telegram: {msg} — печатаю в блокнот")
+            ok2, _ = insert_into_notepad(text)
+            return "Telegram недоступен. Напечатала в блокнот." if ok2 else "Не смогла отправить и напечатать."
+        return f"Telegram: {msg}"
+    dialog, label = _tg_find(contact)
+    if dialog is None:
+        if label:
+            return label
+        if fallback_notepad:
+            ok2, _ = insert_into_notepad(text)
+            return f"Контакт '{contact}' не найден в Telegram." + (" Напечатала в блокнот." if ok2 else "")
+        return f"Не нашла '{contact}' в Telegram."
+    rewritten = rewrite_message_for_contact(label, text)
+    if not ctx.confirm(f"Отправить {label}: {rewritten}?", force=True):
+        return "Не отправила."
+    return TG_SERVICE.send_to_dialog(dialog, label, rewritten)
+
+
+def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
+    ctx = ctx or ActionContext({})
+    lower = user_text.lower()
+
+    if intent == "[ACTION_LIBRARY]":
+        return play_library_work(find_work_in_library(user_text))
+
+    if intent == "[ACTION_WEATHER]":
+        city = _extract_weather_city(user_text)
+        day = parse_weather_day(user_text)
+        print(f"🌤️ Погода: {city or 'геолокация'}" + (f", день +{day}" if day else ""))
+        res = get_weather(city, day)
+        return res or (f"Не нашла '{city}'." if city else "Ошибка прогноза.")
+
+    if intent == "[ACTION_TIME]":
+        return say_now(extracted_task if extracted_task in ("time", "date", "both") else "time")
+
+    if intent == "[ACTION_READ]":
+        old = ""
+        try: old = pyperclip.paste() or ""
+        except Exception: pass
+        pyautogui.hotkey("ctrl", "c")
+        time.sleep(0.5)
+        try:
+            sel = pyperclip.paste() or ""
+        except Exception:
+            return "Не смогла прочитать."
+        if not sel.strip() or sel == old:
+            return "Ты ничего не выделил."
+        return think_llm(f"Проанализируй текст: {sel}", "[CHAT]")
+
+    if intent == "[ACTION_SCREEN]":
+        # вопрос пользователя целиком: «что думаешь?», «переведи», «как это исправить?» — а не только «что на экране»
+        return read_screen_and_analyze(extracted_task or ("Объясни ошибку." if "ошибк" in lower else "Что на экране?"))
+
+    if intent == "[ACTION_CLOSE_TAB]":
+        try:
+            pyautogui.hotkey("ctrl", "w")
+            return "Закрыла вкладку."
+        except Exception:
+            return "Не удалось закрыть вкладку."
+
+    if intent == "[ACTION_MINIMIZE_ALL]":
+        if _press_win_d(): return "Свернула всё."
+        try:
+            pyautogui.hotkey("win", "d")
+            return "Свернула всё."
+        except Exception:
+            return "Не удалось."
+
+    if intent == "[ACTION_CLOSE_ALL]":
+        skip = ("roxy console", "roxy live2d", "program manager", "программный менеджер")
+        n = len([w for w in gw.getAllWindows() if (w.title or "").strip() and not any(s in w.title.lower() for s in skip)])
+        if not n:
+            return "Нечего закрывать."
+        if not ctx.confirm(f"Закрыть все окна? Их примерно {n}."):
+            return "Не закрываю."
+        closed, failed = _close_all_windows()
+        if failed: return f"Закрыла {len(closed)}, ошибок {len(failed)}."
+        return f"Закрыла {len(closed)} окон."
+
+    if intent == "[ACTION_HOTKEY]":
+        if "|" not in extracted_task: return "Не поняла клавиши."
+        keys, desc = extracted_task.split("|", 1)
+        print(f"⌨️ {keys}")
+        if keys == "alt+f4" and not ctx.confirm("Закрыть активную программу? Несохранённое пропадёт."):
+            return "Не закрываю."
+        return desc if _press_hotkey(keys) else f"Не удалось {keys}."
+
+    if intent == "[ACTION_PET]":
+        from live2d_client import LIVE2D
+        if extracted_task in ("autonomy_on", "autonomy_off"):
+            ctx.config["pet_autonomy"] = extracted_task == "autonomy_on"
+            try:
+                from settings import save_config
+                save_config(ctx.config)
+            except Exception:
+                pass
+        if not LIVE2D.send("behavior", name=extracted_task):
+            return "Окно Live2D не подключено."
+        # Без тега эмоции: раньше «[happy]» добавлял радостный подскок к каждой команде («иди сюда» → прыжки)
+        return {"autonomy_off": "Стою на месте.", "autonomy_on": "Гуляю сама.", "jump": "Прыгаю.",
+                "perch": "Сажусь на окно.", "floor": "Слезаю.", "come": "Иду к курсору.", "walk": "Гуляю.",
+                "dance": "Танцую.", "spin": "Кручусь.", "magic": "Смотри — магия!", "magic_orb": "Водный шар!", "magic_ice": "Ледяные кристаллы!", "magic_rain": "Сейчас будет дождик!",
+                "magic_fountain": "Фонтан!", "staff_lean": "Передохну.", "staff_twirl": "Смотри, как умею!", "peek": "Ку-ку!", "hide": "Ищи меня!", "push": "Сейчас подвину.", "bow": "Кланяюсь.", "stretch": "Потягиваюсь.",
+                "yawn": "Ааах... зеваю.", "look_around": "Осматриваюсь.", "lean": "Пойду обопрусь о край.",
+                "nod": "Киваю.", "shake": "Мотаю головой."}.get(extracted_task, "Ок.")
+
+    if intent == "[ACTION_VOLUME]":
+        kind, _, val = (extracted_task or "").partition("|")
+        if kind == "playing":
+            track = volume.now_playing()
+            return f"Сейчас играет: {track}." if track else "Не вижу, что играет. Я узнаю трек по окну Spotify или вкладке YouTube, Яндекс Музыки, VK."
+        if kind == "query":
+            cur = volume.get_volume()
+            if cur is None:
+                return "Не могу узнать громкость."
+            return f"Громкость {cur[0]} процентов" + (", но звук выключен." if cur[1] else ".")
+        if kind == "mute":
+            on = val == "1"
+            if not volume.set_mute(on):
+                return "Не получилось."
+            return "Выключила звук." if on else "Включила звук."
+        if kind in ("set", "change"):
+            n = int(val or 0)
+            lvl = volume.set_volume(n) if kind == "set" else volume.change_volume(n)
+            if lvl is None:
+                return "Не получилось."
+            return "Готово." if lvl == "" else f"Громкость {lvl}."
+        return "Не поняла, что сделать со звуком."
+
+    if intent == "[ACTION_MEDIA]":
+        times = 5 if extracted_task in ("volume_up", "volume_down") else 1
+        return "Готово." if media_key(extracted_task, times) else "Не получилось."
+
+    if intent == "[ACTION_VISION]":
+        task = extracted_task or user_text
+        if not ctx.confirm(f"Запустить агента? Он сам будет кликать и печатать: {task}. "
+                           f"Скриншоты окна уходят в облако.", force=True):
+            return "Не запускаю."
+        audio.reset_stop()
+        print("💡 Остановить агента: Num Lock или увести мышь в левый верхний угол.")
+        return execute_vision_task(task, max_steps=10, should_stop=audio.is_stopped)
+
+    # ==================== УДАЛЕНИЕ / ОЧИСТКА ====================
+    if intent == "[ACTION_CLEAR_CONTEXT]":
+        win = gw.getActiveWindow()
+        if not win or not win.title: return "Не вижу активного окна."
+        t = win.title.lower()
+        if "блокнот" in t or "notepad" in t:
+            if not ctx.confirm("Стереть весь текст в Блокноте?"):
+                return "Не трогаю."
+            ok, _ = _clear_notepad()
+            return "Удалила текст из Блокнота." if ok else "Не удалось."
+        hwnd = getattr(win, "_hWnd", None)
+        if hwnd and is_explorer_window(hwnd):      # раньше хватало " — " в заголовке
+            folder = get_active_explorer_path(require_active=True)
+            if not folder: return "Не вижу открытой папки."
+            return _clear_folder_confirmed(ctx, folder)
+        return f"Не знаю, как очистить '{win.title}'."
+
+    if intent == "[ACTION_CLEAR_TEXT]":
+        if not ctx.confirm("Стереть весь текст в Блокноте?"):
+            return "Не трогаю."
+        ok, _ = _clear_notepad()
+        return "Удалила текст из Блокнота." if ok else "Не вижу Блокнота."
+
+    if intent == "[ACTION_DELETE_FILE]":
+        m = _RE_DELETE_FILE.search(user_text)
+        if not m: return "Не поняла, что удалить."
+        raw = m.group(1).strip(" .,!?«»\"'")
+        raw = re.sub(r"\s+(?:из|в)\s+(?:текущей|этой|открытой|данной)\s+(?:папки|директории|каталога)\s*$", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s+(?:с|из)\s+(?:рабочего\s+стола|desktop)\s*$", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s+на\s+(?:рабочем\s+столе|desktop)\s*$", "", raw, flags=re.IGNORECASE)
+        raw = raw.strip(" .,!?«»\"'")
+        if not raw: return "Не поняла, что удалить."
+        target = _find_folder(raw) or _find_file(raw)
+        if not target: return f"Не нашла '{raw}'."
+        is_dir = os.path.isdir(target)
+        if is_dir and is_protected_path(target, PROJECT_DIR, (DESKTOP_PATH,)):
+            return (f"Папку «{_base(target)}» я не удаляю: она системная, личная или в ней лежит проект. "
+                    f"Если правда надо, удали вручную.")
+        kind = "папку" if is_dir else "файл"
+        where = _base(os.path.dirname(target))
+        extra = f" В ней {count_folder_items(target)} объектов." if is_dir else ""
+        if not ctx.confirm(f"Удалить {kind} «{_base(target)}» из «{where}» в корзину?{extra}"):
+            return "Не удаляю."
+        if _send_to_trash(target):
+            return f"Удалила {kind} '{_base(target)}'."
+        return f"Не удалось удалить '{raw}'."
+
+    if intent == "[ACTION_CLEAR_FOLDER]":
+        folder = None
+        m = _RE_CLEAR_FOLDER.search(user_text)
+        if m:
+            name = m.group(1).strip(" .,!?«»\"'")
+            if name:
+                folder = _find_folder(name)
+                if not folder: return f"Не нашла папку '{name}'."
+        if not folder:
+            folder = get_active_explorer_path(require_active=True)
+            if not folder: return "Не вижу открытой папки. Открой её и сделай активной."
+        return _clear_folder_confirmed(ctx, folder)
+
+    # ==================== ОКНА ====================
+    if intent == "[ACTION_MAXIMIZE_FULL]":
+        m = _RE_MAXIMIZE_FULL.search(user_text)
+        target = ""
+        if m: target = (m.group(1) or "").strip(" .,!?")
+        if target and (target.lower() in _WINDOW_NOISE or _WINDOW_NOISE_PREFIX.match(target)): target = ""
+        win = None
+        if target:
+            win = _find_window_by_title(target)
+            if not win: return f"Не нашла окно '{target}'."
+        else: win = gw.getActiveWindow()
+        if not win: return "Нет активного окна."
+        return f"Развернула '{win.title}'." if _safe_maximize(win) else "Не удалось."
+
+    if intent == "[ACTION_WINDOW]":
+        m = _RE_WINDOW.search(user_text)
+        if not m: return "Не поняла."
+        action = (m.group(1) or "").lower().strip()
+        target = (m.group(2) or "").strip(" .,!?")
+        target = re.sub(r"^(?:папку|папка|окно)\s+", "", target, flags=re.IGNORECASE).strip()
+        if _WINDOW_NOISE_PREFIX.match(target): target = ""
+        if action == "свернуть": action = "сверни"
+        elif action == "развернуть": action = "разверни"
+        elif action == "закрыть": action = "закрой"
+        elif action == "активировать": action = "активируй"
+        elif action.startswith("переключись"): action = "активируй"
+        elif action in ("верни", "вернуть", "восстанови", "восстановить", "подними", "поднять"): action = "восстанови"
+        if target.lower() in _WINDOW_NOISE: target = ""
+        print(f"🪟 {action}, '{target or 'активное'}'")
+        try:
+            if target:
+                win = _find_window_by_title(target)
+                if not win: return f"Не нашла '{target}'."
+            else:
+                win = gw.getActiveWindow()
+                if not win: return "Нет активного окна."
+            t = win.title
+            if action == "сверни":
+                win.minimize()
+                return f"Свернула '{t}'."
+            elif action == "разверни":
+                if win.isMinimized:
+                    win.restore()
+                    return f"Развернула '{t}'."
+                return f"Развернула '{t}'." if _safe_maximize(win) else f"Не удалось '{t}'."
+            elif action == "восстанови":
+                if win.isMinimized: win.restore()
+                hwnd = getattr(win, "_hWnd", None)
+                if hwnd: _force_foreground(hwnd)
+                else: win.activate()
+                return f"Восстановила '{t}'."
+            elif action == "закрой":
+                win.close()
+                return f"Закрыла '{t}'."
+            elif action == "активируй":
+                if win.isMinimized: win.restore()
+                win.activate()
+                return f"Активировала '{t}'."
+        except Exception as e: return f"Ошибка: {e}"
+
+    if intent == "[ACTION_MAXIMIZE_CURSOR]":
+        x, y = pyautogui.position()
+        for win in gw.getWindowsAt(x, y):
+            if win.title and win.title not in ("Roxy Console", "Roxy Live2D"):
+                if _safe_maximize(win): return f"Развернула '{win.title}'."
+        return "Не нашла окно под курсором."
+
+    if intent == "[ACTION_SHOW_GUI]":
+        gui.set_visible(True, force_foreground=_force_foreground)
+        return "Показала GUI."
+    if intent == "[ACTION_HIDE_GUI]":
+        gui.set_visible(False)
+        return "Скрыла GUI."
+
+    if intent == "[ACTION_RENAME]":
+        m = re.search(r"переименуй\s+(?:в|на)\s+(.+)", user_text, re.IGNORECASE)
+        if not m: return "Не поняла имя."
+        new_name = re.sub(r'[^\w\s\.-]', '', m.group(1).strip()).strip()
+        # расширение голосом не меняем: F2 выделяет только имя, и «отчёт.txt» дал бы «отчёт.txt.txt»
+        base_name, ext = os.path.splitext(new_name)
+        had_ext = bool(ext) and 1 < len(ext) <= 6 and ext[1:].isalnum()
+        if had_ext:
+            new_name = base_name.strip()
+        new_name = _safe_filename(new_name)
+        if not new_name: return "Не поняла имя."
+        try:
+            x, y = pyautogui.position()
+            target = None
+            for w in gw.getWindowsAt(x, y):
+                if "проводник" in w.title.lower() or "explorer" in w.title.lower():
+                    target = w
+                    break
+            if not target:
+                a = gw.getActiveWindow()
+                if a and ("проводник" in a.title.lower() or "explorer" in a.title.lower()): target = a
+            if not target: return "Не вижу Проводника."
+            if target.isMinimized: target.restore()
+            target.activate()
+            time.sleep(0.5)
+            # F2 сам выделяет имя без расширения. Ctrl+A НЕ нажимаем: если F2 не вошёл в режим правки
+            # (ничего не выбрано), Ctrl+A выделил бы ВСЕ файлы, а Enter открыл бы их все.
+            pyautogui.press('f2')
+            time.sleep(0.5)
+            type_text(new_name)          # кириллица через буфер, pyautogui.write её не вводит
+            time.sleep(0.2)
+            pyautogui.press('enter')
+            note = " Расширение оставила прежним." if had_ext else ""
+            return f"Переименовала в '{new_name}'.{note}"
+        except Exception as e: return f"Ошибка: {e}"
+
+    # ==================== TELEGRAM ====================
+    if intent == "[ACTION_TG_HELP]":
+        return ("Не поняла Telegram-команду. Форматы: «прочитай телеграм <контакт>», "
+                "«напиши в телеграм <контакт> <текст>», «ответь в телеграм <контакт> <что ответить>».")
+
+    if intent in ("[ACTION_TG_SEND_MAYBE]", "[ACTION_TG_SEND]"):
+        if "|" not in extracted_task: return "Формат: 'напиши в телеграм <контакт> <текст>'."
+        contact, text = extracted_task.split("|", 1)
+        print(f"📨 TG: {contact} → {text[:60]}")
+        return _tg_send(ctx, contact, text, fallback_notepad=(intent == "[ACTION_TG_SEND_MAYBE]"))
+
+    if intent == "[ACTION_TG_REPLY]":
+        if "|" not in extracted_task: return "Формат: 'ответь <контакт> <текст>'."
+        contact, instruction = extracted_task.split("|", 1)
+        ok, msg = _init_telegram_if_needed(ctx.config)
+        if not ok: return f"Telegram: {msg}"
+        dialog, label = _tg_find(contact)
+        if dialog is None: return label or f"Не нашла '{contact}'."
+        try:
+            history = "\n".join(TG_SERVICE.read_last(dialog, limit=20))
+        except Exception as e:
+            return f"Ошибка чтения: {e}"
+        reply = draft_tg_reply(history, instruction)
+        if not reply: return "Не смогла составить ответ."
+        # force: ответ сочинила LLM по тексту ЧУЖОЙ переписки — без «да» от тебя он не уходит, даже при confirm_dangerous=false
+        if not ctx.confirm(f"Ответить {label}: {reply}?", force=True):
+            return "Не отправила."
+        return TG_SERVICE.send_to_dialog(dialog, label, reply)
+
+    if intent == "[ACTION_TG_READ]":
+        ok, msg = _init_telegram_if_needed(ctx.config)
+        if not ok: return f"Telegram: {msg}"
+        contact = extracted_task.strip()
+        if not contact: return "Укажи контакт: 'прочитай телеграм <контакт>'."
+        dialog, label = _tg_find(contact)
+        if dialog is None: return label or f"Не нашла диалог '{contact}'."
+        try:
+            msgs = TG_SERVICE.read_last(dialog, limit=10)
+        except Exception as e:
+            return f"Ошибка чтения: {e}"
+        return f"Последние {len(msgs)} сообщений с {label}:\n" + "\n".join(msgs)
+
+    # ==================== ТЕКСТ И КОД ====================
+    if intent == "[ACTION_CODE_FILE]":
+        task = extracted_task or lower
+        if not extracted_task:
+            task = re.sub(r"\bв\s+(?:текущ\w*|этом\s+|это\s+|открыт\w*)\s+(?:блокнот\w*|проводник\w*|окн\w*|окошк\w*)\b", " ", task)
+            task = re.sub(r"\b(?:тут|сюда|здесь|напиши|создай|сделай|сгенерируй|вставь|ставь|введи|впиши|веди|пиши|выведи|тот|блокнот|мне)\b", " ", task)
+            task = re.sub(r"\s+", " ", task).strip(" .,!?-\n\t")
+        print(f"💻 Код: {task}")
+        code = generate_code(task)
+        if not code: return "Не удалось сгенерировать код."
+        clean = clean_code(code)
+        # 1) открытый пустой Блокнот → пишем прямо в него
+        if set_text_if_empty(_find_notepad_window(), clean):
+            return "Код вставила в Блокнот."
+        # 2) иначе — сохраняем .py и открываем его Блокнотом (новая вкладка уже С КОДОМ)
+        path = _save_generated_code(clean, task)
+        if path and open_file_in_notepad(path):
+            return "Код готов, открыла его в Блокноте. Файл лежит в папке generated_code."
+        try:
+            pyperclip.copy(clean)
+            return "Код в буфере — не смогла открыть Блокнот."
+        except Exception:
+            return "Не удалось."
+
+    if intent == "[ACTION_NEW_TAB]":
+        if "блокнот" in lower:
+            wins = gw.getWindowsWithTitle('Блокнот') + gw.getWindowsWithTitle('Notepad')
+            if not wins:
+                subprocess.Popen("notepad.exe")
+                time.sleep(1)
+                _focus_new_app("notepad.exe", timeout=2.0)
+                wins = gw.getWindowsWithTitle('Блокнот') + gw.getWindowsWithTitle('Notepad')
+            if wins:
+                try:
+                    wins[0].activate()
+                    time.sleep(0.5)
+                    pyautogui.hotkey('ctrl', 'n')
+                    return "Новая вкладка в Блокноте."
+                except Exception: pass
+            return "Не нашла Блокнот."
+        pyautogui.hotkey('ctrl', 'n')
+        return "Новая вкладка."
+
+    if intent == "[ACTION_CREATE]":
+        is_folder = "папку" in lower
+        use_current = bool(_RE_HERE.search(user_text))
+        nm = re.search(r"(?:с\s+(?:названием|именем)|назови|именем)\s+[«\"]?(.+?)[»\"]?\s*$", user_text, re.IGNORECASE)
+        if nm:
+            name = nm.group(1).strip()
+            name = re.sub(r" (?:на рабочем столе|файл|папку|блокнот|текстовик|документ|тут|здесь)", "", name, flags=re.IGNORECASE).strip()
+        else: name = ""
+        if not name:
+            m2 = re.search(r"(?:папку|файл|блокнот|текстовик|документ)\s+([А-Яа-яЁёA-Za-z0-9_\-\.]+)(?=\s+(?:в|на)\s+)", user_text, re.IGNORECASE)
+            if m2: name = m2.group(1).strip()
+        name = name.strip(" .,!?-\"«»")
+        name = re.sub(r"\s+\.", ".", name)
+        if not name: name = "Новая папка" if is_folder else "Новый файл"
+        if not is_folder and not name.endswith(".txt") and "." not in name: name += ".txt"
+
+        explicit = _RE_EXPLICIT_FOLDER.search(user_text)
+        base_dir = DESKTOP_PATH
+        if explicit:
+            fn = explicit.group(1).strip()
+            if fn:
+                found = _find_folder(fn)
+                if not found: return f"Не нашла '{fn}'."
+                base_dir = found
+                use_current = False
+        elif use_current:
+            cur = get_active_explorer_path()
+            if cur: base_dir = cur
+            else: use_current = False
+
+        name = _safe_filename(name) or ("Новая папка" if is_folder else "Новый файл.txt")
+        target = os.path.join(base_dir, name)
+        try:
+            if is_folder:
+                existed = os.path.isdir(target)
+                os.makedirs(target, exist_ok=True)
+                _open_path(target)
+                return f"Папка {name} уже есть, открыла её." if existed else f"Создала папку {name}."
+            else:
+                try:
+                    with open(target, "x", encoding="utf-8"):     # "x": существующий файл НЕ затираем
+                        pass
+                    created = True
+                except FileExistsError:
+                    created = False
+                _open_path(target)
+                return f"Создала файл {name}." if created else f"Файл {name} уже есть, не стала его затирать, просто открыла."
+        except Exception as e: return f"Ошибка: {e}"
+
+    if intent == "[ACTION_OPEN]":
+        m = re.search(
+            r"(?:откр[оыа]й|отр[оыа]й|открыть|запуст[иь]|включ[иь]|вруби|старт)\s+(?:(?:программу|файл|папку|каталог|директорию)\s+)?(.+)",
+            user_text, re.IGNORECASE
+        )
+        if not m: return "Не поняла, что открыть."
+        raw = m.group(1).strip()
+        raw = re.sub(r"\bв\s+(?:текущей|этой|открытой|данной)\s+(?:папке|директории|каталоге)\b", " ", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\b(?:с|под|со)\s+(?:названием|именем)\b", " ", raw, flags=re.IGNORECASE)
+        raw = re.sub(r'[.!?]+$', '', raw).strip()
+        raw = re.sub(r"\s+(?:с|из)\s+(?:рабочего\s+стола|desktop)\s*$", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"\s+на\s+(?:рабочем\s+столе|desktop)\s*$", "", raw, flags=re.IGNORECASE)
+        raw = re.sub(r"^(?:папку|папка|каталог|файл|директорию)\s+", "", raw, flags=re.IGNORECASE)
+        raw = raw.strip(" .,!?«»\"'")
+        raw = re.sub(r"\s+", " ", raw).strip()
+        if not raw: return "Не поняла, что открыть."
+
+        is_file = bool(re.search(r"\.\w{2,5}\b", raw)) or ("файл" in lower)
+        if is_file:
+            tokens = raw.split()
+            prog = None
+            if tokens and tokens[0].lower() in APP_DICT:
+                prog = tokens[0].lower()
+                tokens = tokens[1:]
+            fname = " ".join(tokens).strip()
+            if not fname: return "Не поняла файл."
+            fp = _find_file(fname)
+            if not fp:
+                print(f"👁️ Vision: {fname}...")
+                cand = _smart_find(ctx, fname, "файл")
+                if cand: fp = _find_file(cand)
+            if fp:
+                try:
+                    os.startfile(fp)
+                    _bring_to_front(os.path.basename(fp), timeout=2.0)
+                    return f"Открываю '{os.path.basename(fp)}'."
+                except Exception as e: return f"Ошибка: {e}"
+            if prog and prog in APP_DICT:
+                subprocess.Popen(APP_DICT[prog], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                return f"Файл не нашла, но открыла {prog}."
+            return f"Не нашла '{fname}'."
+
+        prog_lower = raw.lower().strip()
+        if prog_lower in APP_DICT:
+            try:
+                subprocess.Popen(APP_DICT[prog_lower], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                if APP_DICT[prog_lower].endswith(".exe") and " " not in APP_DICT[prog_lower]: _focus_new_app(APP_DICT[prog_lower], timeout=3.0)
+                else: _bring_to_front(raw, timeout=3.0)
+                return f"Открываю {raw}."
+            except Exception: return f"Не удалось {raw}."
+
+        if _FOLDER_KW.search(user_text):
+            fn = _clean_folder_query(raw)
+            p = _find_folder(fn) if fn else None
+            if p:
+                os.startfile(p)
+                base = os.path.basename(p.rstrip("\\/"))
+                _bring_to_front(base, timeout=3.0)
+                return f"Открываю папку '{base or p}'."
+            if fn:
+                fp = _find_file(fn)
+                if not fp:
+                    cand = _smart_find(ctx, fn, "папка")
+                    if cand:
+                        fc = _find_folder(cand)
+                        if fc:
+                            os.startfile(fc)
+                            return f"Открываю '{os.path.basename(fc)}'."
+                        fp = _find_file(cand)
+                if fp:
+                    os.startfile(fp)
+                    return f"Открываю '{os.path.basename(fp)}'."
+                return f"Не нашла '{fn}'."
+            os.startfile(DESKTOP_PATH)
+            return "Открываю рабочий стол."
+
+        fp = _find_file(raw)
+        if fp:
+            try:
+                os.startfile(fp)
+                return f"Открываю '{os.path.basename(fp)}'."
+            except Exception: pass
+
+        print(f"🔍 Launch '{raw}'...")
+        ok, method = _launch_by_name(raw)
+        if ok:
+            print(f"✅ {method}")
+            return f"Открываю {raw}."
+
+        cand = _smart_find(ctx, raw, "элемент")
+        if cand:
+            fp = _find_file(cand)
+            if fp:
+                os.startfile(fp)
+                return f"Открываю '{os.path.basename(fp)}'."
+            fd = _find_folder(cand)
+            if fd:
+                os.startfile(fd)
+                return f"Открываю '{os.path.basename(fd)}'."
+
+
+        return f"Не нашла '{raw}'."
+
+    if intent == "[ACTION_TYPE]":
+        m = re.search(r"(?:напиши|введи|напечатай|вставь|ставь|впиши|запиши|добавь)\s+(.+)", user_text, re.IGNORECASE)
+        if not m: return "Не поняла, что печатать."
+        t = m.group(1).strip()
+        t = re.sub(r"^(?:сюда|тут|здесь|в\s+(?:текущ\w*\s+|это\s+|этом\s+|это\s+же\s+|открыт\w*\s+)?(?:блокнот\w*|проводник\w*|окн\w*|окошк\w*))\s+", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"^текст\w*[.,!?;:\s]+", "", t, flags=re.IGNORECASE)
+        t = t.lstrip(", ").strip()
+        if not t: return "Не поняла, что вставлять."
+        print(f"⌨️ {t[:80]}...")
+        ok, why = insert_into_notepad(t)
+        if ok and why == "unverified":
+            return "Напечатала. Если текста не видно — он в буфере, нажми Ctrl+V."
+        if ok:
+            return f"Напечатала: {t[:60]}" + ("..." if len(t) > 60 else "")
+        try:
+            pyperclip.copy(t)
+            return "Не смогла вставить, текст в буфере — нажми Ctrl+V." if why != "Блокнот не найден" else "Текст в буфере — Блокнот не найден."
+        except Exception:
+            return "Не удалось."
+
+    # ==================== ТАЙМЕРЫ ====================
+    if intent == "[ACTION_TIMER]":
+        secs, _ = parse_duration(user_text)
+        if not secs: return "На сколько поставить таймер? Скажи, например: таймер на пять минут."
+        d = format_duration(secs)
+        ctx.timers.add(secs, f"Таймер закончился! Прошло {d}.")
+        return f"Поставила таймер. Время: {d}."
+
+    if intent == "[ACTION_REMIND]":
+        secs, what = parse_reminder(user_text)
+        if not secs: return "Через сколько напомнить? Например: напомни через десять минут выключить чайник."
+        ctx.timers.add(secs, f"Напоминаю: {what}." if what else "Напоминаю!")
+        return f"Напомню через {format_duration(secs)}" + (f": {what}." if what else ".")
+
+    if intent == "[ACTION_TIMER_CANCEL]":
+        n = ctx.timers.cancel_all()
+        return f"Отменила {n}." if n else "Таймеров нет."
+
+    if intent == "[ACTION_TIMER_LIST]":
+        items = ctx.timers.describe()
+        if not items: return "Таймеров нет."
+        return "Осталось: " + "; ".join(f"{left} — {msg}" for left, msg in items)
+
+    return None
+
+
+def _clear_folder_confirmed(ctx, folder):
+    name = _base(folder)
+    if is_clear_forbidden(folder, PROJECT_DIR, (DESKTOP_PATH,), allow=(DESKTOP_PATH,)):
+        return (f"Папку «{name}» целиком не очищаю: она системная, личная или в ней лежит проект. "
+                f"Скажи, какой файл удалить, или очисти вручную.")
+    n = count_folder_items(folder)
+    if n == 0:
+        return f"Папка '{name}' уже пуста."
+    if not ctx.confirm(f"Отправить в корзину всё из папки «{name}»? Это {n} объектов."):
+        return "Не удаляю."
+    d, f = _clear_folder_contents(folder)
+    return f"Очистила '{name}': удалено {d}, ошибок {f}."

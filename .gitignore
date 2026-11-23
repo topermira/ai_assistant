@@ -1,0 +1,51 @@
+# ===== СЕКРЕТЫ И ЛИЧНЫЕ ДАННЫЕ — НИКОГДА НЕ КОММИТИТЬ =====
+.env
+.env.*
+!.env.example
+*.session
+*.session-journal
+roxy_session*
+config.json
+config.json.broken
+config.json.tmp
+memory.json
+memory.json.tmp
+*.pem
+*.key
+logs/
+*.log
+temp/
+rvc_output/
+Claude outputs/
+_to_delete/
+
+# ===== модели, голоса и тяжёлые данные (качаются скриптами setup_*.py; у моделей свои лицензии) =====
+*.vrm
+*.moc3
+live2d_assets/vroid_layers/
+piper_voice/
+whisper_medium_model/
+vosk_model_ru/
+library/
+sounds/
+live2d_assets/models/roxy/
+live2d_assets/roxy.ico
+*.pth
+*.index
+*.onnx
+*.pt
+*.ckpt
+*.safetensors
+
+# ===== окружение, кэши, IDE =====
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.idea/
+.vscode/
+*.bak
+timers.json
+timers.json.tmp

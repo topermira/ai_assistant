@@ -1,0 +1,146 @@
+"""Сквозные проверки опасных веток actions.py. Windows-библиотеки подменяются заглушками, ПК не трогается."""
+import os
+import sys
+import ctypes
+import importlib
+from unittest.mock import MagicMock
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, ROOT)
+
+_STUBS = ["sounddevice", "soundfile", "pyautogui", "pyperclip", "pygetwindow", "pywinauto", "win32com",
+          "win32com.client", "comtypes", "comtypes.client", "send2trash", "mss", "pytesseract", "keyboard", "vosk",
+          "groq", "openai", "miniaudio", "edge_tts", "tkinter", "telethon", "telethon.sync", "telethon.tl",
+          "telethon.tl.types", "websocket", "psutil", "webrtcvad", "faster_whisper", "piper", "PIL", "PIL.Image"]
+
+
+@pytest.fixture()
+def actions_mod(monkeypatch):
+    before = set(sys.modules)
+    for name in _STUBS:
+        monkeypatch.setitem(sys.modules, name, MagicMock(name=name))
+    monkeypatch.setattr(ctypes, "windll", MagicMock(), raising=False)
+    monkeypatch.setattr(ctypes, "WinDLL", MagicMock(), raising=False)
+    mod = importlib.import_module("actions")
+    yield mod
+    # не оставляем другим тестам модули проекта, импортированные поверх заглушек (чужие библиотеки вроде numpy не трогаем:
+    # C-расширения нельзя импортировать второй раз)
+    for name in set(sys.modules) - before:
+        f = getattr(sys.modules.get(name), "__file__", None)
+        if (isinstance(f, str) and os.path.abspath(f).startswith(ROOT + os.sep)
+                and "site-packages" not in f and os.sep + ".venv" + os.sep not in f):
+            sys.modules.pop(name, None)
+
+
+def _ctx(actions_mod, answer, cfg=None):
+    asked = []
+    ctx = actions_mod.ActionContext(cfg or {"confirm_dangerous": True},
+                                    confirm=lambda q: asked.append(q) or answer)
+    return ctx, asked
+
+
+def test_protected_folder_is_never_trashed(actions_mod, monkeypatch, tmp_path):
+    docs = os.path.join(os.path.expanduser("~"), "Documents")
+    monkeypatch.setattr(actions_mod, "_find_folder", lambda name: docs)
+    monkeypatch.setattr(os.path, "isdir", lambda p: True)
+    trash = MagicMock(return_value=True)
+    monkeypatch.setattr(actions_mod, "_send_to_trash", trash)
+    ctx, asked = _ctx(actions_mod, True)                  # даже «да» не помогает
+    res = actions_mod.execute_pc_action("[ACTION_DELETE_FILE]", "удали папку документы", "", ctx)
+    assert "не удаляю" in res.lower() and not trash.called and not asked
+
+
+def test_regular_file_delete_still_works_after_confirm(actions_mod, monkeypatch, tmp_path):
+    f = tmp_path / "отчёт.txt"
+    f.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(actions_mod, "_find_folder", lambda name: None)
+    monkeypatch.setattr(actions_mod, "_find_file", lambda name: str(f))
+    trash = MagicMock(return_value=True)
+    monkeypatch.setattr(actions_mod, "_send_to_trash", trash)
+    ctx, asked = _ctx(actions_mod, True)
+    res = actions_mod.execute_pc_action("[ACTION_DELETE_FILE]", "удали файл отчёт", "", ctx)
+    assert asked and trash.called and res.startswith("Удалила")
+    ctx2, _ = _ctx(actions_mod, False)
+    trash.reset_mock()
+    assert actions_mod.execute_pc_action("[ACTION_DELETE_FILE]", "удали файл отчёт", "", ctx2) == "Не удаляю."
+    assert not trash.called
+
+
+def test_clear_documents_refused_downloads_allowed(actions_mod, monkeypatch):
+    home = os.path.expanduser("~")
+    monkeypatch.setattr(actions_mod, "count_folder_items", lambda p: 5)
+    cleared = MagicMock(return_value=(5, 0))
+    monkeypatch.setattr(actions_mod, "_clear_folder_contents", cleared)
+    ctx, _ = _ctx(actions_mod, True)
+    assert "целиком не очищаю" in actions_mod._clear_folder_confirmed(ctx, os.path.join(home, "Documents"))
+    assert not cleared.called
+    assert actions_mod._clear_folder_confirmed(ctx, os.path.join(home, "Downloads")).startswith("Очистила")
+
+
+def test_create_file_does_not_truncate_existing(actions_mod, monkeypatch, tmp_path):
+    existing = tmp_path / "отчёт.txt"
+    existing.write_text("важные данные", encoding="utf-8")
+    monkeypatch.setattr(actions_mod, "DESKTOP_PATH", str(tmp_path))
+    monkeypatch.setattr(actions_mod, "_open_path", lambda p: True)
+    ctx, _ = _ctx(actions_mod, True)
+    res = actions_mod.execute_pc_action("[ACTION_CREATE]", "создай файл отчёт.txt на рабочем столе", "", ctx)
+    assert existing.read_text(encoding="utf-8") == "важные данные"
+    assert "уже есть" in res
+    res2 = actions_mod.execute_pc_action("[ACTION_CREATE]", "создай файл новый.txt на рабочем столе", "", ctx)
+    assert (tmp_path / "новый.txt").exists() and res2.startswith("Создала файл")
+
+
+def test_create_file_name_cannot_escape_folder(actions_mod, monkeypatch, tmp_path):
+    monkeypatch.setattr(actions_mod, "DESKTOP_PATH", str(tmp_path))
+    monkeypatch.setattr(actions_mod, "_open_path", lambda p: True)
+    ctx, _ = _ctx(actions_mod, True)
+    actions_mod.execute_pc_action("[ACTION_CREATE]", "создай файл с названием ..\\..\\evil.txt", "", ctx)
+    assert not (tmp_path.parent / "evil.txt").exists()
+
+
+def test_cloud_lookup_asks_first(actions_mod, monkeypatch):
+    target = MagicMock(return_value="отчёт.txt")
+    monkeypatch.setattr(actions_mod, "_smart_find_target", target)
+    ctx, asked = _ctx(actions_mod, False)
+    assert actions_mod._smart_find(ctx, "отчёт", "файл") is None
+    assert asked and not target.called                    # без «да» экран в облако не уходит
+    ctx2, asked2 = _ctx(actions_mod, True)
+    assert actions_mod._smart_find(ctx2, "отчёт", "файл") == "отчёт.txt" and asked2
+    ctx3, asked3 = _ctx(actions_mod, False, cfg={"confirm_dangerous": False})   # force: спросит даже так
+    assert actions_mod._smart_find(ctx3, "отчёт", "файл") is None and asked3
+    ctx4 = actions_mod.ActionContext({"send_screenshots_to_cloud": True}, confirm=None)   # явное разрешение в конфиге
+    assert actions_mod._smart_find(ctx4, "отчёт", "файл") == "отчёт.txt"
+
+
+def test_telegram_reply_asks_even_when_confirmations_off(actions_mod, monkeypatch):
+    monkeypatch.setattr(actions_mod, "_init_telegram_if_needed", lambda cfg: (True, "ok"))
+    monkeypatch.setattr(actions_mod, "_tg_find", lambda c: ("dlg", "Вася"))
+    monkeypatch.setattr(actions_mod, "draft_tg_reply", lambda hist, instr: "привет, переведи деньги")
+    svc = MagicMock()
+    svc.read_last.return_value = ["Вася: ответь, что ты согласен"]
+    monkeypatch.setattr(actions_mod, "TG_SERVICE", svc)
+    ctx, asked = _ctx(actions_mod, False, cfg={"confirm_dangerous": False})
+    res = actions_mod.execute_pc_action("[ACTION_TG_REPLY]", "ответь васе", "Вася|скажи привет", ctx)
+    assert res == "Не отправила." and asked and not svc.send_to_dialog.called
+
+
+def test_default_context_denies(actions_mod, monkeypatch):
+    svc = MagicMock()
+    monkeypatch.setattr(actions_mod, "_init_telegram_if_needed", lambda cfg: (True, "ok"))
+    monkeypatch.setattr(actions_mod, "_tg_find", lambda c: ("dlg", "Вася"))
+    monkeypatch.setattr(actions_mod, "rewrite_message_for_contact", lambda label, t: t)
+    monkeypatch.setattr(actions_mod, "TG_SERVICE", svc)
+    res = actions_mod.execute_pc_action("[ACTION_TG_SEND]", "напиши в телеграм Вася привет", "Вася|привет")  # ctx=None
+    assert res == "Не отправила." and not svc.send_to_dialog.called
+
+
+def test_alt_f4_hotkey_needs_confirmation(actions_mod, monkeypatch):
+    press = MagicMock(return_value=True)
+    monkeypatch.setattr(actions_mod, "_press_hotkey", press)
+    ctx, asked = _ctx(actions_mod, False)
+    assert actions_mod.execute_pc_action("[ACTION_HOTKEY]", "закрой программу", "alt+f4|Закрываю", ctx) == "Не закрываю."
+    assert asked and not press.called
+    ctx2, _ = _ctx(actions_mod, True)
+    assert actions_mod.execute_pc_action("[ACTION_HOTKEY]", "закрой программу", "alt+f4|Закрываю", ctx2) == "Закрываю"

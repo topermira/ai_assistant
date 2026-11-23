@@ -1,0 +1,33 @@
+# основное (как было)
+numpy
+sounddevice
+soundfile
+miniaudio
+edge-tts
+piper-tts
+faster-whisper
+vosk
+openai
+groq
+pyperclip
+pytesseract
+mss
+pyautogui
+pygetwindow
+pywinauto
+keyboard
+Pillow
+websocket-client
+websockets
+PySide6
+telethon
+pywin32
+comtypes
+send2trash      # без него удаление теперь ОТКЛЮЧЕНО (раньше удаляло навсегда)
+
+# новое, необязательное
+psutil              # поиск зависших live2d_window.py (иначе PowerShell)
+webrtcvad-wheels    # точнее определяет конец фразы (иначе порог громкости)
+
+# для тестов
+pytest
