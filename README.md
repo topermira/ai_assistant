@@ -4,6 +4,20 @@
 таймер, погода, музыка, Telegram, код), отвечает голосом и живёт на рабочем столе 3D-аватаром (VRM) в прозрачном окне:
 гуляет, колдует посохом, играет с окнами и танцует под музыку. Её можно перебить голосом.
 
+[![Roxy demo](docs/demo.gif)](docs/roxy_demo.mp4)
+
+**[▶ Полное видео (41 с)](docs/roxy_demo.mp4)** — первые сцены записаны в самом приложении, блок «Управление с телефона» — иллюстрация-макет, а не запись экрана.
+
+*Аватар на демо — пользовательская VRM-модель, в репозиторий она не входит: положи свою VRM в `live2d_assets/models/`.*
+
+> **English summary.** Roxy is a Russian-language voice assistant for Windows, written in Python. It listens for the wake word,
+> understands spoken commands (open apps, manage windows and files, timers, weather, music, screen reading) and answers by voice.
+> A 3D VRM avatar lives on the desktop in a transparent window, and the PC can be controlled remotely from a phone via Telegram.
+> **Stack:** Vosk (wake word), faster-whisper (speech recognition), Piper / RVC (TTS), OpenRouter and Groq (LLM), Tesseract OCR,
+> three.js + three-vrm, Telethon. **Safety:** confirmation before dangerous actions, protected system folders, localhost-only
+> avatar window, secrets kept in `.env` and masked in logs, an automated test that checks the code for leaked secrets.
+> Models and voices are not included (see Quick start); Windows only.
+
 ## Быстрый старт
 
 1. Python-окружение и пакеты:
@@ -160,6 +174,8 @@ Bot API при этом не используется — работает, да
 | `live2d_posetest` | `false` | отладка: все позы стоя по очереди каждые 6 с |
 
 ## Безопасность
+- Удалённое управление с телефона принимает команды только из твоих собственных исходящих сообщений в одном выбранном чате (`tg_remote_chat`). Поэтому файл сессии `roxy_session.session` равен доступу к твоему аккаунту и компьютеру: не коммить его, не копируй и никому не отдавай. Если он утёк, завершить сессию можно в Telegram: Настройки → Устройства.
+- Для публичного репозитория: `.env`, сессия, `config.json` и `memory.json` в `.gitignore`; перед публикацией запусти `python check_secrets.py`.
 - Ключи и токены — только в `.env` (или переменных окружения). В логах и консоли они маскируются.
 - Перед удалением, очисткой папки, закрытием программы, Telegram-отправкой и Vision-агентом Рокси спрашивает «да/нет».
 - Системные и личные папки (профиль, Документы, диски, Windows, папка проекта) она не удаляет вообще.
