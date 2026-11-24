@@ -19,7 +19,7 @@ import soundfile as sf
 import miniaudio
 import edge_tts
 
-from settings import TEMP_DIR, PIPER_MODEL_PATH, RVC_EXE, RVC_VOICE_NAME, RVC_PITCH, config
+from settings import TEMP_DIR, PIPER_MODEL_PATH, RVC_EXE, RVC_VOICE_NAME, RVC_PITCH, config, live_config
 from text_tts import preprocess_text_for_tts, split_for_pipeline
 
 # ==================== ПРЕРЫВАНИЕ ====================
@@ -136,11 +136,22 @@ def _lip_sync_thread(audio_data, sample_rate, t0, done):
         pass
 
 
+def voice_volume():
+    """Громкость её голоса из лаунчера (0…1.5), применяется сразу."""
+    try:
+        return max(0.0, min(1.5, float(live_config("voice_volume", 1.0))))
+    except (TypeError, ValueError):
+        return 1.0
+
+
 def play(data, sr, lipsync=True, do_normalize=True):
     """Блокирует до конца звука. Возвращает False, если перебили."""
     data = to_mono(data)
     if do_normalize:
         data = normalize(data)
+    vol = voice_volume()
+    if vol != 1.0:
+        data = np.clip(data * vol, -1.0, 1.0).astype(np.float32)
     if _stop.is_set():
         return False
     done = threading.Event()
@@ -196,7 +207,7 @@ def beep(freq=880, dur=0.12, volume=0.25):
         t = np.linspace(0, dur, int(sr * dur), endpoint=False)
         tone = np.sin(2 * np.pi * freq * t).astype(np.float32)
         fade = np.minimum(1.0, np.minimum(t, dur - t) / 0.015).astype(np.float32)
-        sd.play(tone * fade * volume, sr)
+        sd.play(tone * fade * volume * min(1.0, voice_volume()), sr)
         sd.wait()
     except Exception:
         pass

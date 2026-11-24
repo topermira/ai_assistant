@@ -49,7 +49,7 @@ from PySide6.QtGui import (QPainter, QColor, QFont, QPixmap, QPainterPath, QIcon
                            QLinearGradient, QFontDatabase, QTextCursor)
 from PySide6.QtWidgets import (QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton,
                                QAbstractButton, QFrame, QScrollArea, QPlainTextEdit, QSystemTrayIcon, QMenu,
-                               QButtonGroup, QSizePolicy)
+                               QButtonGroup, QSizePolicy, QSlider, QComboBox, QLineEdit)
 from PySide6.QtNetwork import QLocalServer, QLocalSocket
 
 import settings
@@ -76,6 +76,7 @@ SECTIONS = [
     ]),
     ("Аватар", [
         ("pet_autonomy", "Живёт сама", "Гуляет, садится на окна, прячется, колдует", True),
+        ("music_dance", "Танцует под музыку", "Играет музыка — может сама пуститься в пляс", True),
         ("live2d_shadows", "Тени", "Мягкие тени на одежде и на полу", True),
     ]),
     ("Скорость и память", [
@@ -238,6 +239,19 @@ class Row(QFrame):
     def mouseReleaseEvent(self, e):
         if e.button() == Qt.LeftButton:
             self.toggle.toggle()
+
+
+class Combo(QComboBox):
+    """Выпадающий список со стрелкой: стиль из STYLE убирает стандартную, рисуем свою."""
+
+    def paintEvent(self, e):
+        super().paintEvent(e)
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setPen(QPen(QColor(MUTED), 1.6, Qt.SolidLine, Qt.RoundCap, Qt.RoundJoin))
+        x, y = self.width() - 18, self.height() / 2
+        p.drawPolyline([QPointF(x - 4, y - 2), QPointF(x, y + 2), QPointF(x + 4, y - 2)])
+        p.end()
 
 
 def card(title):
@@ -429,7 +443,45 @@ QScrollBar::add-line, QScrollBar::sub-line {{ height: 0; }}
         font-family: 'Cascadia Mono', 'Consolas', monospace; font-size: 8.5pt; padding: 6px; }}
 #last {{ color: {MUTED}; font-size: 9pt; background: transparent; }}
 #foot {{ color: #5d6372; font-size: 8pt; background: transparent; }}
+#pct {{ color: {TEXT}; font-weight: 600; min-width: 42px; background: transparent; }}
+QSlider {{ background: transparent; }}
+QSlider::groove:horizontal {{ height: 6px; border-radius: 3px; background: #2a2e39; }}
+QSlider::sub-page:horizontal {{ height: 6px; border-radius: 3px;
+    background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {ACCENT}, stop:1 {ACCENT2}); }}
+QSlider::handle:horizontal {{ width: 16px; height: 16px; margin: -6px 0; border-radius: 8px; background: #f2f4f8; }}
+QSlider::handle:horizontal:hover {{ background: white; }}
+QComboBox {{ background: #15171d; border: 1px solid {CARD_BORDER}; border-radius: 9px; padding: 6px 28px 6px 10px; }}
+QComboBox:hover {{ border-color: #39404f; }}
+QComboBox::drop-down {{ border: none; width: 22px; }}
+QComboBox QAbstractItemView {{ background: #1c1f26; border: 1px solid {CARD_BORDER}; selection-background-color: #2f3a5c; outline: none; }}
+#chat {{ background: rgba(10, 12, 18, 0.55); border: 1px solid #353c58; border-radius: 11px; padding: 9px 12px; color: {TEXT}; }}
+#chat:focus {{ border-color: {ACCENT}; }}
+#chat:disabled {{ color: {MUTED}; border-color: #2a2e3d; }}
+#send {{ border: none; border-radius: 11px; padding: 0 14px; font-weight: 700; color: white; min-height: 36px;
+         background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {ACCENT}, stop:1 {ACCENT2}); }}
+#send:hover {{ background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 #829ef5, stop:1 #ab90f3); }}
+#send:disabled {{ background: #2c303b; color: {MUTED}; }}
 """
+
+# настройки, которые Рокси подхватывает сама, без перезапуска
+LIVE_KEYS = {"voice_volume", "music_dance"}
+_MAPPER = re.compile(r"sound mapper|переназначение|первичный драйвер|primary sound", re.I)
+
+
+def input_devices():
+    """Имена микрофонов в том же списке (host API по умолчанию), по которому их ищет stt.py."""
+    try:
+        import sounddevice as sd
+        api = sd.default.hostapi
+        out = []
+        for d in sd.query_devices():
+            n = d.get("name", "")
+            if d.get("max_input_channels", 0) > 0 and d.get("hostapi") == api and not _MAPPER.search(n) and n not in out:
+                out.append(n)
+        return out
+    except Exception as e:
+        _log(f"input_devices: {e}")
+        return []
 
 _PILL = {
     "off": ("Выключена", "#2a2d36", MUTED),
@@ -507,6 +559,20 @@ class Launcher(QWidget):
         self.big.setCursor(Qt.PointingHandCursor)
         self.big.clicked.connect(self._big_clicked)
         hv.addWidget(self.big)
+        cr = QHBoxLayout()
+        cr.setSpacing(8)
+        self.chat = QLineEdit()
+        self.chat.setObjectName("chat")
+        self.chat.setMaxLength(2000)
+        self.chat.returnPressed.connect(self._send_text)
+        self.send = QPushButton("➤")
+        self.send.setObjectName("send")
+        self.send.setCursor(Qt.PointingHandCursor)
+        self.send.setToolTip("Отправить (Enter)")
+        self.send.clicked.connect(self._send_text)
+        cr.addWidget(self.chat, 1)
+        cr.addWidget(self.send)
+        hv.addLayout(cr)
         self.last = QLabel("")
         self.last.setObjectName("last")
         self.last.setWordWrap(True)
@@ -558,6 +624,59 @@ class Launcher(QWidget):
         vs.setWordWrap(True)
         vs.setContentsMargins(14, 0, 14, 8)
         v.addWidget(vs)
+        v.addWidget(divider())
+
+        vr = QHBoxLayout()
+        vr.setContentsMargins(14, 10, 14, 4)
+        vr.setSpacing(12)
+        vt = QLabel("Громкость голоса")
+        vt.setObjectName("rowTitle")
+        self.vol = QSlider(Qt.Horizontal)
+        self.vol.setRange(0, 150)
+        self.vol.setSingleStep(5)
+        self.vol.setPageStep(10)
+        self.vol.setCursor(Qt.PointingHandCursor)
+        try:
+            cur_v = int(round(float(self.cfg.get("voice_volume", 1.0)) * 100))
+        except (TypeError, ValueError):
+            cur_v = 100
+        self.vol.setValue(max(0, min(150, cur_v)))
+        self.vol_pct = QLabel(f"{self.vol.value()}%")
+        self.vol_pct.setObjectName("pct")
+        self.vol_pct.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._vol_timer = QTimer(self)
+        self._vol_timer.setSingleShot(True)
+        self._vol_timer.setInterval(250)              # не писать config.json на каждый пиксель ползунка
+        self._vol_timer.timeout.connect(lambda: self._set("voice_volume", round(self.vol.value() / 100, 2)))
+        self.vol.valueChanged.connect(lambda x: (self.vol_pct.setText(f"{x}%"), self._vol_timer.start()))
+        vr.addWidget(vt)
+        vr.addWidget(self.vol, 1)
+        vr.addWidget(self.vol_pct)
+        v.addLayout(vr)
+        vh = QLabel("Только её голос, не общая громкость Windows; меняется сразу")
+        vh.setObjectName("rowSub")
+        vh.setContentsMargins(14, 0, 14, 8)
+        v.addWidget(vh)
+        v.addWidget(divider())
+
+        mr = QHBoxLayout()
+        mr.setContentsMargins(14, 10, 14, 4)
+        mr.setSpacing(12)
+        mt = QLabel("Микрофон")
+        mt.setObjectName("rowTitle")
+        self.mic = Combo()
+        self.mic.setCursor(Qt.PointingHandCursor)
+        self.mic.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
+        self.mic.setMinimumContentsLength(12)
+        self._fill_mics()
+        self.mic.currentIndexChanged.connect(lambda _i: self._set("mic_device", self.mic.currentData() or ""))
+        mr.addWidget(mt)
+        mr.addWidget(self.mic, 1)
+        v.addLayout(mr)
+        mh = QLabel("Применится после перезапуска Рокси")
+        mh.setObjectName("rowSub")
+        mh.setContentsMargins(14, 0, 14, 10)
+        v.addWidget(mh)
         lay.addWidget(c)
 
         # ---- тумблеры ----
@@ -654,17 +773,48 @@ class Launcher(QWidget):
         self.last.setText(text)
         self.last.setVisible(bool(text))
 
+    def _fill_mics(self):
+        cur = str(self.cfg.get("mic_device", "") or "")
+        self.mic.blockSignals(True)
+        self.mic.clear()
+        self.mic.addItem("Системный по умолчанию", "")
+        names = input_devices()
+        for n in names:
+            self.mic.addItem(n, n)
+        if cur and cur not in names:
+            self.mic.addItem(f"{cur} (не подключён)", cur)
+        i = self.mic.findData(cur)
+        self.mic.setCurrentIndex(max(0, i))
+        self.mic.blockSignals(False)
+
+    def _send_text(self):
+        text = self.chat.text().strip()
+        if not text or self.roxy.st not in ("on", "external"):
+            return
+        try:
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            name = f"roxy_typed_{_time.time_ns()}.txt"
+            tmp = os.path.join(TEMP_DIR, name + ".part")
+            with open(tmp, "w", encoding="utf-8") as f:
+                f.write(text)
+            os.replace(tmp, os.path.join(TEMP_DIR, name))   # Рокси видит файл только целиком
+        except OSError as e:
+            self._say(f"Не получилось отправить: {e}")
+            return
+        self.chat.clear()
+        self._say(f"⌨️ Ты написал: {text[:120]}")
+
     # ---- настройки ----
     def _set(self, key, val):
         try:
             cfg = load_config()                # свежая копия: Рокси могла сама поменять голос командой
             cfg[key] = val
-            save_config(cfg)
+            save_config(cfg, from_launcher=True)
             self.cfg = cfg
         except Exception as e:
             self._msg(f"Не получилось сохранить настройку: {e}")
             return
-        if self.roxy.st in ("on", "starting", "external"):
+        if key not in LIVE_KEYS and self.roxy.st in ("on", "starting", "external"):
             self.banner.show()
 
     def _autostart(self, on):
@@ -728,6 +878,11 @@ class Launcher(QWidget):
         self.big.style().unpolish(self.big)
         self.big.style().polish(self.big)
         self.big.setEnabled(st != "stopping")
+        talk = st in ("on", "external")
+        self.chat.setEnabled(talk)
+        self.send.setEnabled(talk)
+        self.chat.setPlaceholderText("Написать Рокси…" if talk else
+                                     ("Она просыпается…" if st == "starting" else "Сначала разбуди Рокси"))
         self.tray_act.setText("Включить Рокси" if st == "off" else "Выключить Рокси")
         self.tray.setToolTip(f"Рокси — {text.lower()}")
         if st == "off":
@@ -739,7 +894,7 @@ class Launcher(QWidget):
             elif self._quitting:
                 QApplication.quit()
         if st == "on":
-            self._say("Скажи «Рокси» или нажми Num + рядом с ней, чтобы написать")
+            self._say("Скажи «Рокси» или напиши ей прямо здесь")
 
     def _on_line(self, ln):
         if not _NOISE.match(ln):
@@ -787,6 +942,10 @@ class Launcher(QWidget):
 
     def showEvent(self, e):
         super().showEvent(e)
+        try:
+            self._fill_mics()                       # гарнитуру могли подключить, пока окно было в трее
+        except Exception:
+            pass
         if IS_WIN:                                  # тёмная рамка окна Windows 10/11
             try:
                 hwnd = int(self.winId())

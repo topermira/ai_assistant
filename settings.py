@@ -155,9 +155,43 @@ def load_config():
         return defaults
 
 
-def save_config(cfg):
+_live = {"mtime": None, "cfg": {}}
+
+
+def live_config(key, default=None):
+    """Значение из config.json с перечитыванием при изменении файла — для настроек, которые
+    лаунчер меняет на лету (громкость голоса), без перезапуска Рокси."""
+    try:
+        mt = os.path.getmtime(CONFIG_FILE)
+    except OSError:
+        return default
+    if mt != _live["mtime"]:
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                _live["cfg"] = json.load(f)
+            _live["mtime"] = mt
+        except Exception:
+            pass                       # файл как раз переписывают — возьмём прошлое значение
+    return _live["cfg"].get(key, default)
+
+
+# Эти ключи меняет только лаунчер, и Рокси читает их на лету; её копия config в памяти могла устареть —
+# при сохранении из Рокси берём их с диска, иначе она бы откатывала громкость/микрофон из лаунчера.
+LAUNCHER_LIVE_KEYS = ("voice_volume", "mic_device", "music_dance")
+
+
+def save_config(cfg, from_launcher=False):
     """Атомарная запись: сначала во временный файл, потом замена — обрыв посреди записи не портит config.json."""
     data = dict(cfg)
+    if not from_launcher and os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                disk = json.load(f)
+            for k in LAUNCHER_LIVE_KEYS:
+                if k in disk:
+                    data[k] = disk[k]
+        except Exception:
+            pass
     if TG_API_ID and TG_API_HASH:
         for k in _SECRET_CONFIG_KEYS:
             data.pop(k, None)

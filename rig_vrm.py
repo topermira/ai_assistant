@@ -169,6 +169,45 @@ def main(src, dst):
     HJO = view(J, BIN, hattrs['JOINTS_0']); HWE = view(J, BIN, hattrs['WEIGHTS_0'])
     HB = [1.31, 1.19, 1.07, 0.96, 0.87, 0.80]
     head = name2i['J_Bip_C_Head']
+    # Косы в исходной модели висят ВНУТРИ плаща: он расходится от спины колоколом (на высоте 0.9 м — на 7 см
+    # дальше от спины, чем коса). Пружины держали их там же, а шарики-препятствия с изнанки толкали
+    # косу ещё глубже. Отодвигаем косы наружу, на поверхность накидки и плаща (+ 8 мм), — дальше их держат
+    # шарики под тканью (см. «braid_cloth_cg»).
+    cl_prims = [p_ for p_ in bm['primitives'] if J['materials'][p_['material']]['name'].startswith('N00_007_03_Tops_01_CLOTH_0')]
+    CLV = P[np.unique(np.concatenate([view(J, BIN, p_['indices']).ravel() for p_ in cl_prims]))]
+    braid_mask = (HP[:, 1] < 1.30) & (HP[:, 2] > 0.06)
+    YG = np.arange(0.76, 1.32, 0.02)
+    braid_surf = {}
+    for side, sgn in (('L', -1), ('R', 1)):
+        m_ = braid_mask & (HP[:, 0] * sgn > 0)
+        dz = np.zeros(len(YG))
+        for k, y in enumerate(YG):
+            sl = m_ & (np.abs(HP[:, 1] - y) < 0.012)
+            if sl.sum() < 4:
+                continue
+            xc = float(np.median(HP[sl, 0]))
+            zf = float(np.percentile(HP[sl, 2], 10))            # передняя (к спине) сторона косы
+            cs = (np.abs(CLV[:, 1] - y) < 0.015) & (np.abs(CLV[:, 0] - xc) < 0.035) & (CLV[:, 2] > 0)
+            if cs.any():
+                dz[k] = max(0.0, float(CLV[cs, 2].max()) + 0.008 - zf)
+        dz = np.maximum.accumulate(dz[::-1])[::-1]                # ниже — не меньше (коса не загибается внутрь)
+        dz = np.convolve(np.pad(dz, 2, mode='edge'), np.ones(5) / 5, mode='valid')
+        dz *= smoothstep(1.30, 1.22, YG)                          # у затылка коса остаётся на месте
+        sel = m_
+        HP[sel, 2] += np.interp(HP[sel, 1], YG, dz)
+        braid_surf[side] = []
+        for y in np.arange(0.80, 1.29, 0.04):                     # точки поверхности ткани за косой
+            sl = m_ & (np.abs(HP[:, 1] - y) < 0.015)
+            if sl.sum() < 4:
+                continue
+            xc = float(np.median(HP[sl, 0]))
+            cs = (np.abs(CLV[:, 1] - y) < 0.015) & (np.abs(CLV[:, 0] - xc) < 0.03) & (CLV[:, 2] > 0)
+            if cs.any():
+                braid_surf[side].append((xc, float(y), float(CLV[cs, 2].max())))
+        print(f'braid {side}: сдвиг наружу до {dz.max() * 100:.1f} см')
+    write_back(J, BIN, hattrs['POSITION'], HP)
+    acc = J['accessors'][hattrs['POSITION']]
+    acc['min'] = HP.min(axis=0).tolist(); acc['max'] = HP.max(axis=0).tolist()
     braid_chains = []
     for side, sgn in (('L', -1), ('R', 1)):
         pts = []
@@ -201,6 +240,22 @@ def main(src, dst):
             yy = float(np.median(HP[brim_v[near], 1])) if near.sum() >= 3 else 1.52
             pts.append([bc[0] + r * np.sin(np.radians(t)), yy, bc[1] + r * np.cos(np.radians(t))])
         brim_chains.append(add_chain(f'J_Sec_C_HatBrim{int(t + 180):03d}_', head, pts))
+
+    # ---------------- ТУЛЬЯ И КОНЧИК ШЛЯПЫ ----------------
+    # Своих костей у тульи не было (мягкость изображал шейдер страницы — почти незаметно). Цепочка из 4 костей
+    # по средней линии: от основания тульи вверх и по смятому кончику назад-влево. Пружина: кончик покачивается
+    # при ходьбе, прыжках и поворотах головы, руки над головой его отталкивают.
+    HV = HP[hat_v]
+    def cen(m_):
+        return HV[m_].mean(axis=0)
+    crown_pts = [cen(np.abs(HV[:, 1] - 1.59) < 0.012),
+                 cen((HV[:, 1] > 1.655) & (HV[:, 1] < 1.70) & (HV[:, 2] < 0.10)),
+                 cen(HV[:, 1] > HV[:, 1].max() - 0.02),
+                 cen((HV[:, 1] > 1.62) & (HV[:, 2] > 0.13) & (HV[:, 2] < 0.17)),
+                 cen((HV[:, 1] > 1.6) & (HV[:, 2] > HV[HV[:, 1] > 1.6, 2].max() - 0.025))]
+    crown_pts[0][1] = 1.59
+    crown_chain = add_chain('J_Sec_C_HatCrown', head, [p_.tolist() for p_ in crown_pts])
+    print('hat crown chain:', np.round(np.array(crown_pts), 3).tolist())
 
     # ---------------- ЮБКА ----------------
     # Было 6 цепочек по ~2 кости (перед/бок/зад), перед и зад висели на бёдрах: юбка ломалась углами.
@@ -256,7 +311,7 @@ def main(src, dst):
     coat_bones = [ni for ch in coat_chains for ni in ch[:-1]]      # кончики (_end) веса не получают
     braid_bones = [ni for ch in braid_chains for ni in ch[:-1]]
     coat_slot = extend_skin(body_skin, [ni for ch in coat_chains for ni in ch] + [ni for ch in skirt_chains for ni in ch])
-    braid_slot = extend_skin(hair_skin, [ni for ch in braid_chains for ni in ch] + [ni for ch in brim_chains for ni in ch])
+    braid_slot = extend_skin(hair_skin, [ni for ch in braid_chains for ni in ch] + [ni for ch in brim_chains for ni in ch] + crown_chain)
 
     def chain_weights(y, H):
         """Веса по костям цепочки (палатки с центрами в серединах костей) для высоты y."""
@@ -396,6 +451,39 @@ def main(src, dst):
                     new[sl] = new.get(sl, 0) + aw * bw
         blend(vi, HJO, HWE, new)
 
+    # тулья: параметр u вдоль средней линии (0 — основание, 4 — кончик); веса — «палатки» по костям,
+    # доля цепочки растёт от основания (u 0.15…0.6) — у ленты шляпа остаётся на голове
+    CP = np.array(crown_pts)
+    nb = len(CP) - 1
+    ncr = 0
+    for vi in hat_v:
+        if HP[vi, 1] < 1.585:
+            continue
+        best = (1e9, 0.0)
+        for b in range(nb):
+            a0, b0 = CP[b], CP[b + 1]; ab = b0 - a0
+            t_ = float(np.clip((HP[vi] - a0) @ ab / (ab @ ab), 0, 1))
+            d_ = float(np.linalg.norm(HP[vi] - (a0 + ab * t_)))
+            if d_ < best[0]:
+                best = (d_, b + t_)
+        u = best[1]
+        k = float(smoothstep(0.15, 0.6, u))
+        if k <= 0:
+            continue
+        uc = min(max(u, 0.5), nb - 0.5)
+        new = {'_k': k}
+        tot = 0.0
+        for b in range(nb):
+            bw = max(0.0, 1 - abs(uc - (b + 0.5)))
+            if bw > 1e-4:
+                new[braid_slot[crown_chain[b]]] = bw; tot += bw
+        for kk in list(new):
+            if kk != '_k':
+                new[kk] /= tot
+        blend(vi, HJO, HWE, new)
+        ncr += 1
+    print('hat crown verts:', ncr)
+
     # ---------------- ПРУЖИНЫ VRM 0.x ----------------
     sa = J['extensions']['VRM']['secondaryAnimation']
     cgs = sa['colliderGroups']
@@ -445,6 +533,32 @@ def main(src, dst):
             p = wpos(ni); dirin = -np.array([p[0], 0, p[2]]) / max(np.hypot(p[0], p[2]), 1e-6)
             cgs.append({'node': ni, 'colliders': [{'offset': {'x': float(dirin[0] * 0.035), 'y': 0, 'z': float(dirin[2] * 0.035)}, 'radius': 0.045}]})
             skirt_bulk_cg.append(len(cgs) - 1)
+    # Препятствия для кос — шарики под самой тканью за косой (поверхность шарика = поверхность ткани):
+    # у накидки — на верхней груди, ниже — на ближайших костях спинки плаща (едут вместе с ним).
+    # Центр шарика — внутри, под тканью: коса, лежащая сверху, выталкивается наружу, а не внутрь.
+    braid_cloth_cg = []
+    BR_R = 0.12                          # крупные: центр глубоко под тканью — коса с любой стороны выталкивается наружу
+    back_joints = [ni for ch in coat_chains if 'SideA' not in nodes[ch[0]]['name'] for ni in ch[:-1]]
+    upper = name2i['J_Bip_C_UpperChest']
+    hips_node = name2i['J_Bip_C_Hips']
+    for side in 'LR':
+        for xc, y, zs in braid_surf[side]:
+            c = np.array([xc, y, zs - BR_R])
+            if y > 1.12:
+                ni = upper
+            else:
+                # кость, которая ведёт отрезок плаща на этой высоте (шарик поворачивается вместе с ним);
+                # выше корня цепочки — таз
+                ch = next(c_ for c_ in coat_chains if 'LongBack' in nodes[c_[0]]['name'] and nodes[c_[0]]['name'][6] == side)
+                ni = hips_node
+                for k in range(len(ch) - 1):
+                    if wpos(ch[k])[1] >= y > wpos(ch[k + 1])[1]:
+                        ni = ch[k]
+            o = c - wpos(ni)
+            # VRM 0.x хранит смещение коллайдера с обратным знаком z (так его читает three-vrm) — проверено в странице
+            cgs.append({'node': ni, 'colliders': [{'offset': {'x': float(o[0]), 'y': float(o[1]), 'z': float(-o[2])}, 'radius': BR_R}]})
+            braid_cloth_cg.append(len(cgs) - 1)
+    print('braid cloth colliders:', len(braid_cloth_cg))
     coat_back_cg = []
     for ch in coat_chains:
         if 'SideA' in nodes[ch[0]]['name']:
@@ -470,13 +584,19 @@ def main(src, dst):
     sa['boneGroups'].append({
         'comment': 'HairBraid', 'stiffiness': 0.7, 'gravityPower': 0.35, 'gravityDir': {'x': 0, 'y': -1, 'z': 0},
         'dragForce': 0.35, 'center': -1, 'hitRadius': 0.02,
-        'bones': [ch[0] for ch in braid_chains], 'colliderGroups': body_cg + [hips_cg] + arm_cg + coat_back_cg})
+        'bones': [ch[0] for ch in braid_chains], 'colliderGroups': body_cg + [hips_cg] + arm_cg + braid_cloth_cg})
 
     # поля шляпы: жёсткие (держат форму), почти без веса; руки их приподнимают
     sa['boneGroups'].append({
         'comment': 'HatBrim', 'stiffiness': 3.0, 'gravityPower': 0.02, 'gravityDir': {'x': 0, 'y': -1, 'z': 0},
         'dragForce': 0.6, 'center': -1, 'hitRadius': 0.02,
         'bones': [ch[0] for ch in brim_chains], 'colliderGroups': arm_cg})
+
+    # тулья: держит форму у основания, кончик мягкий и слегка тяжёлый — качается и догоняет голову
+    sa['boneGroups'].append({
+        'comment': 'HatCrown', 'stiffiness': 1.8, 'gravityPower': 0.04, 'gravityDir': {'x': 0, 'y': -1, 'z': 0},
+        'dragForce': 0.28, 'center': -1, 'hitRadius': 0.035,
+        'bones': [crown_chain[0]], 'colliderGroups': arm_cg})
 
     # ---------------- НАКИДКА У ЛОКТЯ ----------------
     # Рукав накидки свисает за локоть, и в исходной модели соседние вершины его каймы привязаны к предплечью

@@ -417,9 +417,29 @@ def shutdown():
 STOP_FLAG = os.path.join(TEMP_DIR, "roxy_stop.flag")
 
 
+def _take_launcher_messages():
+    """Поле «Написать Рокси» в лаунчере кладёт temp/roxy_typed_*.txt — читаем по порядку и удаляем."""
+    try:
+        names = sorted(n for n in os.listdir(TEMP_DIR) if n.startswith("roxy_typed_") and n.endswith(".txt"))
+    except OSError:
+        return
+    for n in names:
+        p = os.path.join(TEMP_DIR, n)
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                text = f.read().strip()
+            os.remove(p)
+        except OSError:
+            continue
+        if text:
+            on_typed(text[:2000])
+
+
 def _watch_stop_flag():
-    """Лаунчер (roxy_launcher.py) выключает Рокси мягко: кладёт temp/roxy_stop.flag — замечаем и выходим с уборкой."""
+    """Лаунчер (roxy_launcher.py) выключает Рокси мягко: кладёт temp/roxy_stop.flag — замечаем и выходим с уборкой.
+    Заодно забираем то, что написали в лаунчере."""
     while not _shutting_down.is_set():
+        _take_launcher_messages()
         if os.path.exists(STOP_FLAG):
             try:
                 os.remove(STOP_FLAG)
@@ -435,6 +455,9 @@ if __name__ == "__main__":
     try:
         if os.path.exists(STOP_FLAG):              # старый флаг от прошлого раза не должен сразу выключить
             os.remove(STOP_FLAG)
+        for _n in os.listdir(TEMP_DIR):            # и старые недоставленные сообщения из лаунчера
+            if _n.startswith("roxy_typed_") and _n.endswith(".txt"):
+                os.remove(os.path.join(TEMP_DIR, _n))
     except OSError:
         pass
     threading.Thread(target=_watch_stop_flag, daemon=True, name="stop-flag").start()

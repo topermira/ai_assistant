@@ -179,9 +179,9 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         if not LIVE2D.send("behavior", name=extracted_task):
             return "Окно Live2D не подключено."
         # Без тега эмоции: раньше «[happy]» добавлял радостный подскок к каждой команде («иди сюда» → прыжки)
-        return {"autonomy_off": "Стою на месте.", "autonomy_on": "Гуляю сама.", "jump": "Прыгаю.",
+        return {"autonomy_off": "Стою на месте.", "autonomy_on": "Гуляю сама.", "jump": "Прыгаю.", "flip": "Смотри, сальто!", "handstand": "Встаю на руки!", "cartwheel": "Колесо!",
                 "perch": "Сажусь на окно.", "floor": "Слезаю.", "come": "Иду к курсору.", "walk": "Гуляю.",
-                "dance": "Танцую.", "spin": "Кручусь.", "magic": "Смотри — магия!", "magic_orb": "Водный шар!", "magic_ice": "Ледяные кристаллы!", "magic_rain": "Сейчас будет дождик!",
+                "dance": "Танцую.", "dance_music": "Под музыку? С удовольствием!", "dance_stop": "Ладно, отдыхаю.", "spin": "Кручусь.", "magic": "Смотри — магия!", "magic_orb": "Водный шар!", "magic_ice": "Ледяные кристаллы!", "magic_rain": "Сейчас будет дождик!",
                 "magic_fountain": "Фонтан!", "staff_lean": "Передохну.", "staff_twirl": "Смотри, как умею!", "peek": "Ку-ку!", "hide": "Ищи меня!", "push": "Сейчас подвину.", "bow": "Кланяюсь.", "stretch": "Потягиваюсь.",
                 "yawn": "Ааах... зеваю.", "look_around": "Осматриваюсь.", "lean": "Пойду обопрусь о край.",
                 "nod": "Киваю.", "shake": "Мотаю головой."}.get(extracted_task, "Ок.")

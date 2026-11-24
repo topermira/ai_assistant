@@ -130,11 +130,14 @@ const _v1 = new THREE.Vector3(), _v2 = new THREE.Vector3(), _v3 = new THREE.Vect
 const winM = { x: null, y: null, t: 0, vx: 0, vy: 0, ax: 0, ay: 0, rawx: 0, rawy: 0, seen: 0 };
 const _wind = new THREE.Vector3(), _ext = new THREE.Vector3(), _gtmp = new THREE.Vector3();
 let otherJ = [];                    // остальные пружинные цепочки (волосы, ленты, банты)
+let hatJ = [], braidJ = [];         // тулья шляпы и косы — им тоже ветер и инерция от движения окна
 function winMotion(dt) {
   // скорость из последних присланных позиций, сглаженная; ускорение — из изменения сглаженной скорости
   const ppm = Math.max(1, 0.70 * window.innerHeight / H);
   const vx = winM.rawx / ppm, vy = -winM.rawy / ppm;      // экран y вниз → сцена y вверх
-  winM.rawx *= Math.exp(-dt * 8); winM.rawy *= Math.exp(-dt * 8);   // нет новых сдвигов — скорость гаснет
+  // нет новых сдвигов дольше 0.1 с — окно стоит, скорость гаснет. Раньше гасла каждый кадр между сообщениями:
+  // скорость ходила «пилой» с частотой сообщений, и от этой пилы дёргались руки и плащ
+  if (performance.now() / 1000 - (winM.recv || 0) > 0.1) { winM.rawx *= Math.exp(-dt * 8); winM.rawy *= Math.exp(-dt * 8); }
   const k = Math.min(1, dt * 14);
   const nvx = winM.vx + (vx - winM.vx) * k, nvy = winM.vy + (vy - winM.vy) * k;
   const cl = (v, m) => Math.max(-m, Math.min(m, v));
@@ -208,7 +211,8 @@ const exprW = {};                          // плавные веса выраж
 let anim = null, gesture = null, hops = [];
 // ---- позы стоя: живой человек не стоит столбом — вес на одной ноге, вторая расслаблена, иногда меняет позу ----
 const STANCE_NAMES = ['contraL', 'contraR', 'kneeL', 'kneeR', 'handsFront', 'handsBack', 'crossL', 'crossR', 'hipL', 'hipR'];
-const STANCES = [...STANCE_NAMES, 'contraL', 'contraR'];            // «вес на одну ногу» — чаще остальных
+// «руки сложены спереди» сама больше не встаёт — выглядело некрасиво; «вес на одну ногу» — чаще остальных
+const STANCES = [...STANCE_NAMES.filter(n => n !== 'handsFront'), 'contraL', 'contraR'];
 const POSETEST_LIST = [...STANCE_NAMES, 'lean', 'stretch', 'yawn'];
 // опора о край экрана: lean = -1 стена слева, +1 справа, 0 — нет; wallX — x стены в метрах сцены
 let lean = 0, leanW = 0, leanT = 0, wallX = 0;
@@ -226,7 +230,108 @@ const POSETEST_HOLD = _pt !== '1' ? 10 : 6;
 let stance = 'contraL', stanceNext = 6, posetestI = 0;
 const stW = {};                                      // плавные веса поз
 let animW = 0;                                       // пока идёт анимация, позы рук отпускаем
+// танец под музыку: темп и доля — из Python (music.py, раз в 0.5 с); тут свои часы доли, мягко подтягиваемые
+let mdance = false, mdW = 0, beatPh = 0, beatN = 0, musicSt = { on: false, bpm: 120, phase: 0, energy: 0.5 };
 let crouchT = -1, airT = -1, landT = -1, landK = 1;
+let flip = null;                    // сальто назад: { t, dur, land } — пока окно летит вверх-вниз
+let flipAng = 0;
+// Акробатика: стойка на руках и колесо. Позу даёт update(), а положение тела задаёт решатель опоры ниже:
+// тело поворачивается, и самая низкая точка опоры (кисти или ступни) стоит на полу и не скользит.
+let acro = null;                   // { type: 'handstand' | 'cartwheel', t, dur, dir, sup, supX, supZ, hat }
+let acroTh = 0, acroPh = 0, acroLamL = 0, acroLamR = 0, acroInv = 0;
+const HS_KEYS = [[0, 0, 0], [0.9, 2.2, 0], [1.6, Math.PI, Math.PI], [4.4, Math.PI, Math.PI], [5.2, 2.2, 0], [6.0, 0, 0]];   // t, тело, ноги
+const HS_DUR = 6.0, CW_DUR = 2.4;   // колесо медленнее: 1.5 с — мелькало за пару кадров
+const HS_ARM = +(params.get('hsarm') || 2.75);
+const HS_ARMX = +(params.get('hsarmx') || 0);
+function hsAt(t, col, lag) {       // ключевые положения стойки, между ними — плавно
+  t -= lag || 0;
+  for (let i = 1; i < HS_KEYS.length; i++) if (t <= HS_KEYS[i][0]) {
+    const a = HS_KEYS[i - 1], b = HS_KEYS[i], u = smooth((t - a[0]) / (b[0] - a[0]));
+    return a[col] + (b[col] - a[col]) * u;
+  }
+  return HS_KEYS[HS_KEYS.length - 1][col];
+}
+const _acP = new THREE.Vector3(), _acE = new THREE.Euler(0, 0, 0, 'YXZ');
+const _acW1 = new THREE.Vector3(), _acW2 = new THREE.Vector3(), _acW3 = new THREE.Vector3(), _acM = new THREE.Vector3();
+let acroClothW = 0, acroChains = null, acroYOff = 0, acroW = 0, acroCarry = 0, acroCarryAt = 0;
+const stApp = { hb: 0, hipL: 0, hipR: 0 };
+function acroMeasure() {
+  // Решатель опоры ПОСЛЕ позы, по настоящим костям этого же кадра: самая низкая опора (ладони или ступни)
+  // ставится ровно на пол (y = 0) и не скользит по нему. Раньше считалось до позы по прошлому кадру — на
+  // быстром экране расходилось, и Рокси уходила под пол.
+  if (!acro || !vrm) return;
+  const Hm = vrm.humanoid, wp = (n, out) => Hm.getRawBoneNode(n).getWorldPosition(out);
+  const palm = (sd, out) => { wp(sd + 'Hand', out); const m = Hm.getRawBoneNode(sd + 'MiddleProximal'); return m ? out.lerp(m.getWorldPosition(_acM), 0.5) : out; };
+  const sole = (sd, out) => { wp(sd + 'Foot', out); const t = Hm.getRawBoneNode(sd + 'Toes'); return t ? out.lerp(t.getWorldPosition(_acM), 0.5) : out; };
+  const lh = palm('left', new THREE.Vector3()), rh = palm('right', new THREE.Vector3());
+  const lf = sole('left', new THREE.Vector3()), rf = sole('right', new THREE.Vector3());
+  const hd = wp('head', new THREE.Vector3());
+  if (acro.footClr === undefined) acro.footClr = Math.min(lf.y, rf.y) - root.position.y;   // стоя: ступни на полу
+  const hy = Math.min(lh.y, rh.y) - 0.015 * H, fy = Math.min(lf.y, rf.y) - acro.footClr;
+  let dx = 0, dy, dz = 0;
+  if (acro.type === 'handstand') {
+    let sup = acro.sup || 'f';
+    if (sup === 'f' && hy < fy - 0.01 * H) sup = 'h'; else if (sup === 'h' && fy < hy - 0.01 * H) sup = 'f';
+    const c = sup === 'h' ? lh.clone().add(rh).multiplyScalar(0.5) : lf.clone().add(rf).multiplyScalar(0.5);
+    if (sup !== acro.sup) { acro.sup = sup; acro.supX = c.x; acro.supZ = c.z; }
+    dy = -(sup === 'h' ? hy : fy); dx = acro.supX - c.x; dz = acro.supZ - c.z;
+  } else {
+    dy = -Math.min(hy, fy);
+    const hp = wp('hips', new THREE.Vector3());
+    if (acro.hx === undefined) { acro.hx = hp.x; acro.hz = hp.z; }
+    // центр тела катится по полу внутри окна (окно стоит) — по той же кривой, что и поворот
+    const sT = smooth((acro.t / acro.dur - 0.05) / 0.88);
+    dx = acro.hx + acro.dir * (acro.D || 0) * sT - hp.x; dz = acro.hz - hp.z;
+  }
+  dy = Math.max(dy, -(hd.y - 0.1 * H));                                                 // голова — никогда не в полу
+  root.position.x += dx; root.position.y += dy; root.position.z += dz;
+  root.updateMatrixWorld(true);
+}
+function acroCloth(dt) {
+  // Стойка на руках: юбка и плащ «вывернуты» — лежат вдоль тела к голове (плащ — по спине до затылка,
+  // дальше ложится на пол). Пружины вниз головой держали форму «к ногам» и мялись — здесь кости ставим сами.
+  const want = acro && acro.type === 'handstand' ? smooth((acroInv - 0.35) / 0.45) : 0;
+  acroClothW = ease(acroClothW, want, dt, 6);
+  if (acroClothW < 0.002 || !B.hips || !B.neck) return;
+  if (!acroChains) {
+    const m = new Map();
+    for (const jj of [...skirtJ, ...coatJ]) { if (!jj.child) continue; if (!m.has(jj._root)) m.set(jj._root, []); m.get(jj._root).push(jj); }
+    acroChains = [...m.values()].map(c => c.sort((a, b) => a._d - b._d));
+  }
+  B.hips.getWorldPosition(_acW1); B.neck.getWorldPosition(_acW2);
+  const U = _acW3.copy(_acW2).sub(_acW1).normalize();                                     // «к голове» по телу
+  const headD = _acW2.distanceTo(_acW1) + 0.2 * H / 1.75;                                  // от таза до макушки
+  const LF = new THREE.Vector3(), RT = new THREE.Vector3();
+  B.leftUpperLeg.getWorldPosition(LF); B.rightUpperLeg.getWorldPosition(RT);
+  const BACK = LF.sub(RT).cross(U).normalize().negate();                                     // за спину (против «вперёд»)
+  for (const ch of acroChains) {
+    const isCoat = coatJ.includes(ch[0]);
+    for (let k = 0; k < ch.length; k++) {
+      const jj = ch[k], bn = jj.bone;
+      bn.getWorldPosition(_v1); jj.child.getWorldPosition(_v2);
+      const len = _v1.distanceTo(_v2); if (len < 1e-4) continue;
+      _v4.copy(_v1).sub(_acW1); const along = _v4.dot(U); _v4.addScaledVector(U, -along);   // радиально от оси тела
+      const rl = _v4.length(); if (rl > 1e-5) _v4.multiplyScalar(1 / rl); else _v4.set(0, 0, 0);
+      // юбка: от пояса раскрывается и ложится на грудь; плащ: по спине, за макушкой — лежит на полу (наружу)
+      let rk = k === 0 ? 0.35 : 0.06;
+      if (isCoat) {
+        // плащ ложится по спине к затылку: бока заворачивают за спину (внутрь и назад), дальше прилегают к спине;
+        // за затылком — на пол
+        _acM.copy(BACK).addScaledVector(U, -BACK.dot(U)).normalize();
+        const lat = _v4.clone().addScaledVector(_acM, -_v4.dot(_acM));                // вбок от середины спины
+        if (along > headD) _v3.copy(U).multiplyScalar(0.3).addScaledVector(_acM, 1);
+        else if (k === 0) { const sl = lat.length();      // бока (sl≈1) уходят на спину сбоку-сзади, середина — прилегает
+          _v3.copy(U).multiplyScalar(0.6).addScaledVector(_acM, 0.12 + 0.75 * sl).addScaledVector(lat, -0.3); }
+        else if (k === 1) _v3.copy(U).addScaledVector(_acM, 0.06);
+        else _v3.copy(U).addScaledVector(_acM, 0.02);
+        _v3.normalize();
+      } else _v3.copy(U).addScaledVector(_v4, rk).normalize();
+      aimBone(bn, _v2, _v1.addScaledVector(_v3, len), acroClothW);
+    }
+  }
+}
+const FLIP_DIR = +(params.get('flipdir') || -1);   // −1 — назад (затылком вперёд по ходу)
+const _flipP = new THREE.Vector3();
 let w = { walk: 0, sit: 0, crouch: 0, air: 0, land: 0 };
 let walkPhase = 0, yaw = 0, time = 0, lastActivity = 0;
 let blinkAt = 2, blinkT = -1;
@@ -408,7 +513,11 @@ function update(dt) {
   swingV += (-22 * swing - 3.2 * swingV - dragVx * 0.01) * dt;      // ~0.75 Гц: тяжёлое тело качается медленно
   swing = Math.max(-0.75, Math.min(0.75, swing + swingV * dt));
   dragVx *= Math.exp(-dt * 12);
-  const stand = Math.max(0, 1 - w.walk - w.sit) * (1 - w.air) * (1 - heldW);
+  // в акробатике стоячие позы (рука на бедре, руки за спиной и т.п.) выключены: их IK уводил руки с пола,
+  // и стойка шла на голове (уходила под пол)
+  acroW = ease(acroW, acro || flip ? 1 : 0, dt, acro || flip ? 14 : 5);
+  stApp.hb = stApp.hipL = stApp.hipR = 0;      // что из стоячей позы РЕАЛЬНО применено в этом кадре (сидя — ничего)
+  const stand = Math.max(0, 1 - w.walk - w.sit) * (1 - w.air) * (1 - heldW) * (1 - acroW);
   const happy = exprW.happy || 0;
 
   // ---- база: руки опущены и чуть впереди бёдер, локти мягко согнуты (прямых рук у живых людей не бывает),
@@ -423,7 +532,7 @@ function update(dt) {
   handCurl('left', 0.36); handCurl('right', 0.36);
 
   // ---- стоит: одна нога опорная, другая расслаблена; таз и плечи перекошены; иногда меняет позу ----
-  animW = ease(animW, anim ? 1 : 0, dt, 5);
+  animW = ease(animW, anim || mdance ? 1 : 0, dt, 5);
   if (stand > 0.6 && !anim && !held && !dozing && (!lean || POSETEST) && time > stanceNext) {
     if (POSETEST) {
       const nm = POSETEST_LIST[posetestI++ % POSETEST_LIST.length];
@@ -492,10 +601,12 @@ function update(dt) {
     // руки в позах — через IK (кисть ставится в точку относительно тела), отпускаются на время анимации
     const ak = stand * (1 - animW);
     const hf = stW.handsFront * ak, hb = stW.handsBack * ak;
+    stApp.hb = hb;
     if (hf > 0.001) { ikReq.push({ side: 'left', type: 'front', w: hf }, { side: 'right', type: 'front', w: hf }); handCurl('left', 0.2, hf); handCurl('right', 0.2, hf); }
     if (hb > 0.001) { ikReq.push({ side: 'left', type: 'back', w: hb }, { side: 'right', type: 'back', w: hb }); add('chest', -0.04, 0, 0, hb); handCurl('left', 0.25, hb); handCurl('right', 0.25, hb); }
     // рука на бедре (и у стены — свободная рука тоже на бедре)
     const hipLw = (stW.hipL + (lean > 0 ? 0 : leanW)) * ak, hipRw = (stW.hipR + (lean > 0 ? leanW : 0)) * ak;
+    stApp.hipL = hipLw; stApp.hipR = hipRw;
     if (hipLw > 0.001) { ikReq.push({ side: 'left', type: 'hip', w: hipLw }); handCurl('left', 0.5, hipLw); }
     if (hipRw > 0.001) { ikReq.push({ side: 'right', type: 'hip', w: hipRw }); handCurl('right', 0.5, hipRw); }
     // у стены: рука со стороны стены — ладонью на край экрана, корпус чуть наклонён к стене, голова — от неё
@@ -573,7 +684,7 @@ function update(dt) {
   // насколько руки заняты позой (сложены, за спиной, на бедре, у стены) — тогда жестов руками нет
   const busyL = Math.min(1, stW.handsFront + stW.handsBack + stW.hipL + (lean > 0 ? leanW : 0)) ;
   const busyR = Math.min(1, stW.handsFront + stW.handsBack + stW.hipR + (lean < 0 ? leanW : 0));
-  const gk = talkW * (1 - animW) * (1 - heldW) * (1 - w.air) * (1 - w.walk);   // на ходу руками не жестикулирует
+  const gk = talkW * (1 - animW) * (1 - heldW) * (1 - w.air) * (1 - w.walk) * (1 - acroW);   // на ходу и в акробатике руками не жестикулирует (говоря «Встаю на руки!», уводила руки с пола)
   if (gk > 0.3 && !gest && time > gestNext) {
     const kinds = ['palmL', 'palmR', 'both', 'shrug', 'nod', 'palmR', 'palmL'];
     gest = { kind: kinds[Math.floor(Math.random() * kinds.length)], t: 0, d: 1.0 + Math.random() * 0.5 };
@@ -606,7 +717,7 @@ function update(dt) {
 
   // тело по эмоции (плавно появляется и уходит вместе с выражением лица)
   for (const n of ['happy', 'sad', 'angry', 'surprised', 'shy', 'smug']) emoW[n] = ease(emoW[n] || 0, emotion === n ? 1 : 0, dt, 2.5);
-  const ek = (1 - animW) * (1 - heldW);
+  const ek = (1 - animW) * (1 - heldW) * (1 - acroW);
   if (emoW.sad > 0.01) {                       // ссутулилась: плечи вниз и вперёд, голова опущена
     const k = emoW.sad * ek;
     add('spine', 0.08, 0, 0, k); add('chest', 0.05, 0, 0, k); add('neck', 0.06, 0, 0, k); add('head', 0.12, 0, 0, k);
@@ -630,10 +741,9 @@ function update(dt) {
     add('leftLowerArm', 0, -0.6, 0, k * (1 - busyL)); add('rightLowerArm', 0, 0.6, 0, k * (1 - busyR));
     handCurl('left', -0.3, k); handCurl('right', -0.3, k);
   }
-  if (emoW.shy > 0.01) {                       // голова вниз и вбок, плечи приподняты, руки сложены спереди
+  if (emoW.shy > 0.01) {                       // голова вниз и вбок, плечи приподняты (руки спереди не складывает)
     const k = emoW.shy * ek;
     add('head', 0.12, 0.08, 0.1, k); add('leftShoulder', 0, 0, 0.06, k); add('rightShoulder', 0, 0, -0.06, k);
-    if (stand > 0.5) ikReq.push({ side: 'left', type: 'front', w: k * 0.8 }, { side: 'right', type: 'front', w: k * 0.8 });
   }
   if (emoW.smug > 0.01) {                      // рука на бедре, подбородок вверх, голова набок
     const k = emoW.smug * ek;
@@ -717,23 +827,79 @@ function update(dt) {
   }
   // ---- шляпа слетела: присела, дотянулась, встала и надела обратно ----
   if (hatFall.st === 'pick') {
-    const T = hatFall.t, c = env(T, 0.25, 2.5, 0.75, 0.8), sd = hatFall.side;
-    const th = 1.05 * c, kn = 2.0 * c;
+    // присела → взяла верхушку пальцами → не вставая, согнутой рукой подносит шляпу к голове →
+    // чуть наклоняет голову и надевает → разжимает пальцы → и только потом встаёт
+    const T = hatFall.t, sd = hatFall.side, hs = sd === 'left' ? 1 : -1;
+    const c = env(T, 0.15, HAT_UP_T + 0.9, 0.7, 0.9);                 // присед — до самого конца, встаёт после
+    const th = 1.2 * c, kn = 2.25 * c;
     // колени вместе, голени врозь — в юбке так и приседают
     add('leftUpperLeg', -th, 0, -0.1 * c); add('rightUpperLeg', -th, 0, 0.1 * c);
     add('leftLowerLeg', kn, 0, 0.2 * c); add('rightLowerLeg', kn, 0, -0.2 * c);
     add('leftFoot', -(kn - th) * 0.9); add('rightFoot', -(kn - th) * 0.9);
-    add('spine', 0.45 * c); add('chest', 0.15 * c);
-    add('head', 0.3 * env(T, 0, 2.2, 0.4, 0.6) - 0.15 * env(T, 2.3, 3.4, 0.3, 0.5));   // смотрит на шляпу, потом вверх
+    // тянется к верхушке: сильнее наклоняется вперёд, плечом к шляпе; взяв — выпрямляет спину (шляпа у лица)
+    const rch = env(T, 0.3, HAT_GRAB_T + 0.45, 0.6, 0.5);
+    add('spine', 0.45 * c + 0.35 * rch - 0.4 * env(T, HAT_GRAB_T + 0.2, HAT_UP_T + 0.6, 0.6, 0.5) * c, 0, -hs * 0.12 * rch);
+    add('chest', 0.15 * c + 0.25 * rch, 0, -hs * 0.08 * rch);
+    // смотрит на шляпу; надевая — наклоняет голову вперёд и чуть к руке
+    const tilt = env(T, HAT_GRAB_T + 0.25, HAT_UP_T + 0.35, 0.55, 0.5);
+    add('head', 0.3 * env(T, 0, HAT_GRAB_T + 0.4, 0.4, 0.5) + 0.12 * tilt, 0, HAT_ROLL * hs * 0.4 * tilt);
+    add('neck', 0.04 * tilt, 0, HAT_ROLL * hs * 0.2 * tilt);
     drop += legDrop(th, kn);
-    const wI = env(T, 0.35, 3.7, 0.55, 0.5);
-    ikReq.push({ side: sd, type: T < 1.35 ? 'hatGrab' : T < 2.25 ? 'hatHold' : 'hatHead', w: wI });
-    handCurl(sd, T > 1.2 && T < 3.2 ? 0.55 : 0.1, wI);
+    const wI = env(T, 0.3, HAT_UP_T + 1.0, 0.55, 0.9);
+    ikReq.push({ side: sd, type: T < HAT_GRAB_T ? 'hatGrab' : T < HAT_ON_T ? 'hatLift' : 'hatHead', w: wI });
+    // щепоть на верхушке: сжимает, когда дотянулась, разжимает, когда шляпа на голове
+    handCurl(sd, 0.15 + 0.6 * env(T, HAT_GRAB_T - 0.15, HAT_ON_T + 0.12, 0.2, 0.2), wI);
     // свободная рука — для равновесия чуть в сторону
     const o = sd === 'left' ? 'right' : 'left', sg = o === 'left' ? 1 : -1;
     add(o + 'UpperArm', -0.25 * c, 0, sg * 0.35 * c);
   }
-  if (w.air > 0.01) {
+  // ---- сальто назад: толчок с замахом рук вверх → плотная группировка (колени к груди, руки обхватывают
+  //      голени) → раскрывается к приземлению. Сам поворот — всем телом вокруг центра масс (ниже, у root) ----
+  let flipK = 0;
+  if (flip) {
+    const u = flip.t / flip.dur;
+    flipK = 1;
+    const tk = env(u, 0.08, 0.84, 0.14, 0.2), up = pulse(u, 0.26);
+    add('leftUpperLeg', -2.0 * tk, 0, 0.12 * tk); add('rightUpperLeg', -2.0 * tk, 0, -0.12 * tk);
+    add('leftLowerLeg', 2.3 * tk, 0, 0, 1); add('rightLowerLeg', 2.3 * tk, 0, 0, 1);
+    add('leftFoot', 0.5 * tk); add('rightFoot', 0.5 * tk);
+    add('spine', 0.35 * tk - 0.15 * up); add('chest', 0.2 * tk); add('head', 0.25 * tk - 0.2 * up);
+    // руки: на толчке — вверх, в группировке — вперёд-вниз к голеням, к приземлению — в стороны для равновесия
+    const op = smooth((u - 0.72) / 0.2);
+    add('leftUpperArm', -2.2 * up - 1.1 * tk, 0, 0.25 + 0.6 * op, 1); add('rightUpperArm', -2.2 * up - 1.1 * tk, 0, -0.25 - 0.6 * op, 1);
+    add('leftLowerArm', 0, -0.9 * tk, 0, 1); add('rightLowerArm', 0, 0.9 * tk, 0, 1);
+    handCurl('left', 0.6 * tk, 1); handCurl('right', 0.6 * tk, 1);
+  }
+  // ---- стойка на руках: наклон с прямыми руками к полу → мах ногами (одна раньше) → стоит, чуть балансируя →
+  //      ноги вниз → выпрямляется. Ноги в наклоне держатся вертикально (сгиб в тазу), руки — над головой ----
+  acroTh = 0; acroPh = 0;
+  if (acro && acro.type === 'handstand') {
+    const t = acro.t;
+    acroTh = hsAt(t, 1);
+    acroLamL = hsAt(t, 2, 0); acroLamR = hsAt(t, 2, 0.15);
+    const hold = env(t, 1.6, 4.4, 0.3, 0.3);
+    acroTh += 0.04 * hold * Math.sin(t * 1.9);                       // балансирует
+    const arms = env(t, 0, HS_DUR, 0.7, 0.7);
+    // руки на ширине плеч, почти вдоль тела (голова между ними, на 15–20 см над полом)
+    add('leftUpperArm', HS_ARMX * arms, 0, HS_ARM * arms, 1); add('rightUpperArm', HS_ARMX * arms, 0, -HS_ARM * arms, 1);
+    add('leftLowerArm', 0, -0.05 * arms, 0, 1); add('rightLowerArm', 0, 0.05 * arms, 0, 1);
+    handCurl('left', -0.25 * arms, 1); handCurl('right', -0.25 * arms, 1);
+    add('leftUpperLeg', -(acroTh - acroLamL), 0, 0.05 * hold, 1); add('rightUpperLeg', -(acroTh - acroLamR), 0, -0.05 * hold, 1);
+    add('leftFoot', -0.5 * hold); add('rightFoot', -0.5 * hold);           // носки тянет
+    add('head', -0.35 * hold, 0, 0); add('neck', -0.15 * hold, 0, 0);        // смотрит на пол между руками
+    add('spine', -0.06 * hold); 
+  }
+  // ---- колесо: руки вверх «галочкой», ноги широко, поворот в плоскости лица, окно едет в сторону ----
+  if (acro && acro.type === 'cartwheel') {
+    const u = acro.t / acro.dur, k = env(u, 0, 1, 0.12, 0.15);
+    acroPh = -acro.dir * 2 * Math.PI * smooth((u - 0.05) / 0.88);
+    add('leftUpperArm', -0.15 * k, 0, 2.55 * k, 1); add('rightUpperArm', -0.15 * k, 0, -2.55 * k, 1);
+    add('leftLowerArm', 0, -0.05 * k, 0, 1); add('rightLowerArm', 0, 0.05 * k, 0, 1);
+    add('leftUpperLeg', -0.1 * k, 0, 0.55 * k, 1); add('rightUpperLeg', -0.1 * k, 0, -0.55 * k, 1);
+    add('leftFoot', -0.4 * k); add('rightFoot', -0.4 * k);
+    handCurl('left', -0.25 * k, 1); handCurl('right', -0.25 * k, 1);
+  }
+  if (w.air > 0.01 && !flip) {
     const k = w.air, rise = smooth(Math.min(1, airT / 0.25)), ext = smooth((airT - 0.4) / 0.35);
     const tuck = rise * (1 - 0.55 * ext), throwA = pulse(airT, 0.45);
     add('leftUpperLeg', -1.1 * tuck, 0, 0.05, k); add('rightUpperLeg', -0.85 * tuck, 0, -0.05, k);
@@ -922,6 +1088,50 @@ function update(dt) {
     }
     if (t >= D) anim = null;
   }
+  // ---- танец под музыку ----
+  {
+    const ok = mdance && !anim && !held && !sitting;
+    mdW = ease(mdW, ok ? 1 : 0, dt, 3);
+    const bpm = Math.min(185, Math.max(60, musicSt.bpm || 120));
+    const dph = dt * bpm / 60;
+    beatPh += dph;
+    if (beatPh >= 1) { beatPh -= 1; beatN++; }
+    if (mdW > 0.001) {
+      const k = mdW * (1 - w.air) * (1 - w.walk) * standOnly, E = 0.6 + 0.5 * Math.min(1, musicSt.energy || 0.5);
+      const ph = beatPh, c = Math.cos(2 * Math.PI * ph), dn = 0.5 + 0.5 * c;           // 1 — на долю (присед)
+      const s2 = Math.sin(Math.PI * (beatN % 2 + ph));                                     // качание раз в 2 доли
+      const s4 = Math.sin(Math.PI * ((beatN % 4) + ph) / 2);                              // поворот раз в 4 доли
+      // ноги: пружинит на каждую долю, вес с ноги на ногу
+      add('leftUpperLeg', -0.2 * dn * E - 0.06 * Math.max(0, s2), 0, 0, k); add('leftLowerLeg', 0.38 * dn * E + 0.12 * Math.max(0, s2), 0, 0, k);
+      add('rightUpperLeg', -0.2 * dn * E - 0.06 * Math.max(0, -s2), 0, 0, k); add('rightLowerLeg', 0.38 * dn * E + 0.12 * Math.max(0, -s2), 0, 0, k);
+      add('leftFoot', -0.18 * dn * E, 0, 0, k); add('rightFoot', -0.18 * dn * E, 0, 0, k);
+      rootY -= 0.018 * H * dn * E * k;
+      add('hips', 0, 0.12 * s4, 0.09 * s2, k); add('spine', 0.03 * dn, -0.06 * s4, -0.06 * s2, k); add('chest', 0, -0.04 * s4, -0.03 * s2, k);
+      add('head', 0.07 * dn * E, 0.05 * s4, 0.07 * s2, k); add('neck', 0.03 * dn, 0, 0, k);
+      yawExtra += 0.22 * s4 * k;
+      // руки: фигура меняется каждые 8 долей (2 такта), плавно
+      const sec = Math.floor(beatN / 8) % 3, sp = ((beatN % 8) + ph) / 8;
+      const fade = smooth(Math.min(sp, 1 - sp) * 8);                                       // переход у границ
+      const A = (sec === 0 ? 1 : 0) * fade, Bw = (sec === 1 ? 1 : 0) * fade, Cw = (sec === 2 ? 1 : 0) * fade;
+      // A: кулачки у груди, по очереди вверх-вниз на долю
+      const up = 0.5 + 0.5 * Math.sin(Math.PI * (beatN % 2 + ph) - Math.PI / 2);
+      add('leftUpperArm', -0.55, 0, 0.55 + 0.35 * up, k * A); add('leftLowerArm', 0, -1.6, 0, k * A);
+      add('rightUpperArm', -0.55, 0, -0.55 - 0.35 * (1 - up), k * A); add('rightLowerArm', 0, 1.6, 0, k * A);
+      handCurl('left', 0.9, k * A); handCurl('right', 0.9, k * A);
+      // B: машет над головой — то одной, то другой рукой (по 2 доли)
+      const L = beatN % 4 < 2 ? 1 : 0, wv = 0.25 * Math.sin(2 * Math.PI * ph);
+      add('leftUpperArm', -0.25, 0, 0.12 + 2.1 * L + wv * L, k * Bw); add('leftLowerArm', 0, -0.4 * (1 - L), 0.5 * L + 0.4 * wv * L, k * Bw);
+      add('rightUpperArm', -0.25, 0, -0.12 - 2.1 * (1 - L) + wv * (1 - L), k * Bw); add('rightLowerArm', 0, 0.4 * L, -0.5 * (1 - L) + 0.4 * wv * (1 - L), k * Bw);
+      handCurl('left', -0.2, k * Bw); handCurl('right', -0.2, k * Bw);
+      // C: обе руки вверх «в такт», качаются как над толпой
+      const sw = 0.18 * s2;
+      add('leftUpperArm', -0.3, 0, 1.85 + sw, k * Cw); add('leftLowerArm', 0, 0, 0.3 + 0.2 * dn, k * Cw);   // не над самой шляпой — в стороны
+      add('rightUpperArm', -0.3, 0, -1.85 + sw, k * Cw); add('rightLowerArm', 0, 0, -0.3 - 0.2 * dn, k * Cw);
+      handCurl('left', -0.3, k * Cw); handCurl('right', -0.3, k * Cw);
+      expr('happy', 0.75 * k); expr('blink', 0.2 * k * dn * (beatN % 4 === 3 ? 1 : 0));
+      lastActivity = time;
+    }
+  }
   if (gesture) {
     gesture.t += dt;
     const g = env(gesture.t, 0, gesture.dur, 0.15, 0.25);
@@ -939,8 +1149,38 @@ function update(dt) {
   // при ходьбе — строго в профиль (π/2): раньше было ~65°, и шаги шли «в глубину экрана», а не вдоль
   const yawT = facing * (0.18 + (Math.PI / 2 - 0.18) * w.walk + 0.15 * w.sit);
   yaw = ease(yaw, yawT, dt, 5);
+  if (acro) {
+    acro.t += dt; lastActivity = time;
+    if (acro.t >= acro.dur || held || sitting || airT >= 0) {
+      acroYOff = root.position.y - bob - rootY;
+      if (acro.type === 'cartwheel' && acro.D) { acroCarry = 1; acroCarryAt = time; }   // окно сейчас подъедет
+      acro = null; acroInv = 0;
+    }
+    else if (!acro.hat && hatFall.st === 'on' && acroInv > 0.6 && (acro.type === 'handstand' || Math.random() < 0.4)) {
+      acro.hat = true; dropHat(acro.type === 'handstand' ? 'вниз головой' : 'колесо', true);
+    } else if (acroInv > 0.6) acro.hat = true;
+  }
+  if (acro && acro.type === 'cartwheel') yawExtra -= yaw;     // колесо — лицом к экрану
+  // стойка: заранее поворачивается спиной — вниз головой окажется к нам лицом
+  if (acro && acro.type === 'handstand') yawExtra += (Math.PI - yaw) * env(acro.t, 0, HS_DUR, 0.75, 0.7) - yaw * 0;
+  // в сальто разворачивается в три четверти: его видно сбоку, а не «в глубину экрана»
+  if (flip) yawExtra += facing * 0.85 * env(flip.t / flip.dur, 0, 1.05, 0.15, 0.3);
   root.rotation.y = yaw + yawExtra;
   root.rotation.z = -lean * 0.12 * leanW;                 // наклон всем телом к стене (поворот вокруг ступней)
+  // сальто: поворот назад вокруг поперечной оси через центр масс (в группировке он ~на середине роста)
+  flipAng = 0;
+  if (flip) {
+    flip.t += dt;
+    const u = flip.t / flip.dur;
+    let a = 2 * Math.PI * smooth((u - 0.08) / 0.78);
+    if (flip.land !== undefined) {                        // приземлилась раньше, чем докрутилась — докручивает быстро
+      flip.lt = (flip.lt || 0) + dt;
+      if (flip.la === undefined) flip.la = a;
+      a = flip.la + (2 * Math.PI - flip.la) * smooth(flip.lt / 0.12);
+      if (flip.lt >= 0.12) flip = null;
+    } else if (u > 1.6) flip = null;                       // окно так и не приземлилось — не крутить вечно
+    flipAng = flip ? FLIP_DIR * a : 0;
+  }
   if (leanW > 0.001) { add('leftFoot', 0, 0, lean * 0.12 * leanW); add('rightFoot', 0, 0, lean * 0.12 * leanW); }
   if (edgeW > 0.001) {                                     // выглядывает — клонится из-за края наружу; толкает — к окну
     const tz = (edgeMode === 'peek' ? 0.2 : 0.15) * edgeW * stand;
@@ -958,7 +1198,24 @@ function update(dt) {
     add('leftLowerLeg', 0.55 * tk); add('rightLowerLeg', 0.55 * tk);
     add('leftUpperArm', 0, 0, 0.25 * tk); add('rightUpperArm', 0, 0, -0.25 * tk);
   }
-  root.position.y = bob + rootY;
+  if (!acro) { acroYOff *= Math.exp(-dt * 8); root.position.y = bob + rootY + acroYOff; }   // в акробатике высоту ставит решатель опоры (после позы)
+  root.rotation.order = 'YXZ';
+  root.rotation.x = flipAng + acroTh;
+  root.rotation.z += acroPh;
+  if (flipAng) {                                           // поворот вокруг центра масс, а не вокруг ступней
+    const hc = 0.5 * H;
+    _flipP.set(0, hc, 0).applyEuler(root.rotation);
+    root.position.x = -_flipP.x; root.position.y += hc - _flipP.y; root.position.z = -_flipP.z;
+  } else if (acro) {
+    // Решатель опоры по НАСТОЯЩИМ точкам тела (ладони, ступни — их положение в системе тела с прошлого кадра):
+    // тело повёрнуто, самая низкая опора стоит на полу и не скользит по нему
+    acroInv = 0.5 - 0.5 * Math.cos(acroTh) * Math.cos(acroPh);                            // 1 — вниз головой
+  } else if (acroCarry && time - acroCarryAt < 2.5) {     // колесо: тело стоит, пока окно подъезжает (сдвиг — в winPos)
+  } else {                                                // после акробатики тело плавно возвращается в центр окна
+    acroCarry = 0;
+    const kb = Math.exp(-dt * 5); root.position.x *= kb; root.position.z *= kb;
+    if (Math.abs(root.position.x) < 1e-4) root.position.x = 0; if (Math.abs(root.position.z) < 1e-4) root.position.z = 0;
+  }
 
   // ---- ткань: сидя юбка и полы плаща тяжелеют и ложатся на бёдра (гравитация + коллайдеры ног),
   //      стоя/в движении — почти исходная упругость, но с лёгким провисанием ----
@@ -1002,7 +1259,7 @@ function update(dt) {
     // рука на бедре: локоть отведён назад-вбок, и шары руки распирали плащ «шатром» — он висел на локте и не касался
     // бока. В этой позе плащ своей стороны рука не распирает: он висит у тела, а за руку его убирает шейдер.
     // То же с руками за спиной: локти не выпирают плащ наружу — руки ложатся поверх него (см. шейдер).
-    if (j._long && ((j._left ? stW.hipL : stW.hipR) > 0.3 || stW.handsBack > 0.3)) {
+    if (j._long && ((j._left ? stApp.hipL : stApp.hipR) > 0.3 || stApp.hb > 0.3)) {
       if (!j._cgNoArm || j._cgNoArmOf !== cgBase) {
         j._cgNoArmOf = cgBase;
         j._cgNoArm = cgBase.filter(g => !(g.colliders || []).some(c => /UpperArm|LowerArm|Hand/.test(c.parent && c.parent.name)));
@@ -1034,7 +1291,17 @@ function update(dt) {
       }
     };
     for (const j of otherJ) { j.settings.gravityDir.copy(j._s0.gravityDir); j.settings.gravityPower = j._s0.gravityPower; }
-    apply(coatJ, 1.0, false); apply(skirtJ, 0.6 * (1 - 0.7 * sw), false, 1 - sw);   // сидя поток снизу юбку не задирает apply(otherJ, 0.3, false);
+    apply(coatJ, 1.0, false); apply(skirtJ, 0.6 * (1 - 0.7 * sw), false, 1 - sw);
+    // окно едет по экрану, а сцена в нём стоит — пружины этого сами не чувствуют: шляпа и косы получают
+    // тот же встречный поток и инерцию, что и плащ (слабее) — кончик шляпы отстаёт на ходу и в прыжке
+    apply(hatJ, 0.35, false); apply(braidJ, 0.3, false);
+    // вниз головой: юбка, плащ и косы свисают к голове — тяжелее и мягче (обычная упругость держала их «вверх»)
+    if (acroInv > 0.02) {
+      for (const j of [...skirtJ, ...coatJ, ...braidJ]) {
+        j.settings.gravityPower += 1.4 * acroInv;
+        j.settings.stiffness = (j._s0 ? j._s0.stiffness : j.settings.stiffness) * (1 - 0.7 * acroInv) * (coatJ.includes(j) || skirtJ.includes(j) ? 0.8 : 1);
+      }
+    } else for (const j of braidJ) if (j._s0) j.settings.stiffness = j._s0.stiffness;   // сидя поток снизу юбку не задирает apply(otherJ, 0.3, false);
   }
 
   // инерция рук от ускорения окна: разгон — руки отстают назад, торможение — летят вперёд,
@@ -1050,7 +1317,7 @@ function update(dt) {
   }
 
   // применяем позу (руки/голова — через упругое вторичное движение)
-  const legSoft = Math.max(heldW, w.air * (1 - w.walk)) * 0.85;
+  const legSoft = flip ? 0.25 : Math.max(heldW, w.air * (1 - w.walk)) * 0.85;   // в сальто группировка чёткая, без «ватных» ног
   for (const name in B) {
     let r = P[name] || _zero3;
     const cfg = SEC[name];
@@ -1061,7 +1328,26 @@ function update(dt) {
     B[name].rotation.set(r[0], r[1], r[2]);
   }
   if (B.hips && hips0) B.hips.position.set(hips0.x + FLIP * hipShiftL, hips0.y - drop, hips0.z);
+  dtIK = Math.max(1e-3, dt);
+  if (acro) ikReq.length = 0;                               // руки в акробатике — только своей позой
   if (ikReq.length) solveArmIK();
+  // ладони на полу: кисть согнута к предплечью, ладонь вниз, пальцы — вперёд от неё (как в стойке и колесе)
+  if (acro) {
+    root.updateMatrixWorld(true);
+    _acW1.set(0, 0, 1).applyQuaternion(root.getWorldQuaternion(_iq3)); _acW1.y = 0;
+    if (acro.type === 'handstand' && _acW1.lengthSq() > 1e-4) {
+      _acW1.normalize().negate();                                        // вниз головой «вперёд» тела — к нам
+      const k = env(acro.t, 0.5, HS_DUR - 0.4, 0.5, 0.5);
+      for (const sd of ['left', 'right']) orientHand(sd, B[sd + 'Hand'], _acW1, _acW2.set(0, -1, 0), k);
+    } else if (acro.type === 'cartwheel') {
+      for (const sd of ['left', 'right']) {
+        const hd = B[sd + 'Hand']; hd.getWorldPosition(_acW3);
+        const k = 1 - smooth((_acW3.y - (root.position.y > -1 ? 0 : 0) - 0.05 * H) / (0.2 * H));    // у самого пола
+        _acW2.set(root.position.x, 0, root.position.z); _acW3.sub(root.getWorldPosition(_acM)); _acW3.y = 0;
+        if (k > 0.01 && _acW3.lengthSq() > 1e-4) orientHand(sd, hd, _acW3.normalize(), _acW2.set(0, -1, 0), k);   // пальцы — наружу
+      }
+    }
+  }
 
   // лицо: эмоция, рот, моргание
   const target = EMOTIONS[emotion] || {};
@@ -1265,6 +1551,7 @@ loader.load(MODEL_URL, (gltf) => {
         // остальные цепочки (волосы, ленты) — тоже получают ветер, со своими исходными настройками
         const clothSet = new Set([...skirtJ, ...coatJ]);
         otherJ = js.filter(j => !clothSet.has(j));
+        hatJ = otherJ.filter(j => /HatCrown/.test(j.bone.name)); braidJ = otherJ.filter(j => /HairBraid/.test(j.bone.name));
         for (const j of otherJ) {
           j._s0 = { ...j.settings, gravityDir: j.settings.gravityDir.clone(), cg: j.colliderGroups };
           j.settings.gravityDir = j.settings.gravityDir.clone();
@@ -1416,15 +1703,45 @@ function solveArmIK() {
       // дальше от груди (0.17): предплечье проходит ПЕРЕД передней полой накидки, а не сквозь неё
       _it.copy(_bHd).addScaledVector(_bU, -0.02).addScaledVector(_bF, 0.17).addScaledVector(_bL, sg * 0.03);
       _ip.copy(_bU).multiplyScalar(-1).addScaledVector(_bL, sg * 0.35).addScaledVector(_bF, 0.45);
-    } else if (r.type === 'hatGrab') {   // к краю полей лежащей шляпы, со своей стороны
-      hatFall.obj.localToWorld(_it.copy(hatFall.brimC)); _it.addScaledVector(_bL, sg * 0.16 * H / 1.75);
-      _ip.copy(_bL).multiplyScalar(sg * 0.7).addScaledVector(_bF, -0.3).addScaledVector(_bU, 0.3);
-    } else if (r.type === 'hatHold') {   // шляпа в руке перед грудью
-      _it.copy(_bH).addScaledVector(_bU, 0.28).addScaledVector(_bF, 0.28).addScaledVector(_bL, sg * 0.12);
-      _ip.copy(_bL).multiplyScalar(sg * 0.6).addScaledVector(_bU, -0.6);
-    } else if (r.type === 'hatHead') {   // надевает: держит за край полей сбоку у головы (кисть на уровне полей)
-      _it.copy(_bHd).addScaledVector(_bU, 0.1).addScaledVector(_bL, sg * 0.17).addScaledVector(_bF, 0.04);
-      _ip.copy(_bL).multiplyScalar(sg).addScaledVector(_bF, 0.2).addScaledVector(_bU, -0.3);
+    } else if (r.type === 'hatGrab' || r.type === 'hatLift' || r.type === 'hatHead') {
+      // Хват — щепотью за бок тульи (6 см под верхушкой): пальцы горизонтально внутрь, к оси шляпы, ладонью вниз;
+      // запястье снаружи от тульи, предплечье уходит в сторону над полями, локоть согнут.
+      const S = H / 1.75, f = hatFall;
+      const onHead = f.obj && f.obj.parent ? null : true;
+      hat.head.localToWorld(_ia.copy(f.grip));                           // где хват, когда шляпа на голове
+      hatAxis(_ic);                                                      // ось головы (= ось надетой шляпы)
+      hatOut(_id, true);                                                 // «наружу» от тульи у хвата (на голове)
+      if (r.type === 'hatGrab') {
+        f.obj.localToWorld(_it.copy(f.grip));
+      } else if (r.type === 'hatLift') {
+        // A) вверх перед собой — к точке перед лицом, на 10 см выше места на голове (поля выше лба);
+        // B) назад — над голову; C) по оси головы вниз — надевает. Так тулья не проходит сквозь голову.
+        const ua = f.uA || 0, ub = f.uB || 0, uc = f.uC || 0;
+        _ib.copy(_ia).addScaledVector(_ic, 0.1 * S);                     // над головой
+        _iv.copy(_bF).setY(0).normalize();                               // вперёд по горизонтали (она наклонена)
+        _ie.copy(_ib).addScaledVector(_iv, 0.28 * S);                    // перед лицом
+        if (ub <= 0) _it.copy(f.gA).lerp(_ie, ua).addScaledVector(_iv, 0.08 * S * Math.sin(Math.PI * ua));
+        else if (uc <= 0) _it.copy(_ie).lerp(_ib, ub);
+        else _it.copy(_ib).lerp(_ia, uc);
+      } else {                                                           // отпустила: рука в сторону-вниз, к плечу
+        const rel = smooth((f.t - HAT_ON_T) / 0.45);
+        _it.copy(_ia).addScaledVector(_id, 0.07 * S * rel).addScaledVector(_ic, -0.05 * S * rel);
+      }
+      f.A.copy(_it); r.hatA = f.A;
+      r.aimW = 1 - smooth((f.t - HAT_ON_T) / 0.4);
+      // запястье — снаружи от хвата (по текущему положению шляпы: на полу, в руке или на голове)
+      hatOut(_iv, onHead);
+      _it.addScaledVector(_iv, 0.075 * S);
+      r.hatOut = _hOut.copy(_iv); hatUp(r.hatUp = _hUp, onHead);
+      // локоть: наружу и чуть вверх-назад, плавно меняется по ходу (без переключений — локоть не «щёлкает»)
+      const up = f.uA || 0;
+      // у головы — локоть высоко и в сторону: предплечье идёт над полями почти горизонтально, плечо пересекает
+      // плоскость полей уже за их краем (раньше локоть был под полями — предплечье проходило сквозь них)
+      _ip.copy(_bL).multiplyScalar(sg * (0.8 + 0.3 * up)).addScaledVector(_bU, 0.1 + 0.9 * up).addScaledVector(_bF, -0.1 - 0.1 * up);
+      // цель и полюс сглажены: резкие сдвиги цели (момент хвата, смена этапа) не дёргают руку
+      if (!f.tS || f.t < 0.05) { f.tS = _it.clone(); f.pS = _ip.clone(); }
+      const kS = 1 - Math.exp(-dtIK * 14);
+      f.tS.lerp(_it, kS); f.pS.lerp(_ip, kS); _it.copy(f.tS); _ip.copy(f.pS);
     } else if (r.type === 'staff') {     // посох: от бедра — вверх-вперёд, на броске ещё выше; локоть вниз-наружу
       const u = r.up || 0, c = r.cast || 0;
       _it.copy(_bH).addScaledVector(_bU, 0.06 + 0.2 * u + 0.06 * c).addScaledVector(_bF, 0.14 + 0.16 * u + 0.06 * c)
@@ -1467,13 +1784,79 @@ function solveArmIK() {
     const cosA = Math.max(-1, Math.min(1, (l1 * l1 + dist * dist - l2 * l2) / (2 * l1 * dist)));
     const sinA = Math.sqrt(1 - cosA * cosA);
     _ip.addScaledVector(_id, -_ip.dot(_id));
+    // направление локтя почти вдоль руки — плоскость локтя не определена и скачет от кадра к кадру
+    // (рука и кисть «рябили»): плавно подмешиваем запасное направление «локоть назад-вниз»
+    { const pl = _ip.length(); if (pl < 0.3) { _iv.copy(_bF).multiplyScalar(-0.7).addScaledVector(_bU, -0.3);
+        _iv.addScaledVector(_id, -_iv.dot(_id)); _ip.addScaledVector(_iv, (0.3 - pl) / 0.3); } }
     if (_ip.lengthSq() < 1e-6) _ip.copy(_bL).multiplyScalar(sg);
     _ip.normalize();
     _ie.copy(_ia).addScaledVector(_id, l1 * cosA).addScaledVector(_ip, l1 * sinA);   // где должен быть локоть
     aimBone(ua, _ib, _ie, w);
     la.getWorldPosition(_ib); hd.getWorldPosition(_ic);
     aimBone(la, _ic, _it, w);
+    // шляпа: кисть поворачивается к верхушке — её держат подушечки пальцев, а не запястье
+    if (r.hatA && r.aimW > 0.001) {
+      // пальцы — внутрь, к оси шляпы (против «наружу»), ладонь — вниз (против оси шляпы)
+      _hpin.copy(r.hatOut).negate(); _hp2.copy(r.hatUp).negate();
+      orientHand(r.side, hd, _hpin, _hp2, w * r.aimW);
+    }
   }
+}
+const _hpin = new THREE.Vector3(), _hp2 = new THREE.Vector3(), _hax = new THREE.Vector3(), _hOut = new THREE.Vector3(), _hUp = new THREE.Vector3();
+const _hq = new THREE.Quaternion(), _hm1 = new THREE.Matrix4(), _hm2 = new THREE.Matrix4(), _hv1 = new THREE.Vector3(), _hv2b = new THREE.Vector3(), _hv3 = new THREE.Vector3();
+let dtIK = 1 / 60;
+function hatQuat(out, onHead) { return onHead || !hatFall.obj || !hatFall.obj.parent ? hat.head.getWorldQuaternion(out) : out.copy(hatFall.obj.quaternion); }
+function hatUp(out, onHead) { return out.set(0, 1, 0).applyQuaternion(hatQuat(_hq, onHead)).normalize(); }
+function hatOut(out, onHead) {       // от оси тульи к точке хвата, поперёк оси — «наружу» у хвата
+  const g = hatFall.grip, a = hatFall.apex;
+  return out.set(g.x - a.x, 0, g.z - a.z).normalize().applyQuaternion(hatQuat(_hq, onHead)).normalize();
+}
+const handAx = {};
+function orientHand(side, hd, fW, pW, w) {
+  // Кисть целиком в заданное положение: пальцы вдоль fW, ладонь в сторону pW (раньше поворачивали только
+  // направление пальцев — кисть крутилась вокруг своей оси как попало, «не в ту сторону»)
+  let ax = handAx[side];
+  if (!ax) {
+    const Hm = vrm.humanoid, mp = Hm.getRawBoneNode(side + 'MiddleProximal'), ip = Hm.getRawBoneNode(side + 'IndexProximal'),
+          lp = Hm.getRawBoneNode(side + 'LittleProximal'), tp = Hm.getRawBoneNode(side + 'ThumbProximal');
+    if (!mp || !ip || !lp || !tp) return;
+    const f = mp.position.clone().normalize(), sd = ip.position.clone().sub(lp.position);
+    const n = new THREE.Vector3().crossVectors(f, sd).normalize();
+    // ладонь — с той стороны, куда сгибаются пальцы: туда же смещён большой палец
+    if (tp.position.clone().addScaledVector(f, -tp.position.dot(f)).dot(n) < 0) n.negate();
+    ax = handAx[side] = { f, n };
+  }
+  _hv1.copy(fW).normalize(); _hv2b.copy(pW).addScaledVector(_hv1, -pW.dot(_hv1)).normalize();
+  if (_hv2b.lengthSq() < 1e-6) return;
+  _hv3.crossVectors(_hv1, _hv2b);
+  _hm2.makeBasis(_hv1, _hv2b, _hv3);                                   // желаемый мировой базис
+  const bz = new THREE.Vector3().crossVectors(ax.f, ax.n);
+  _hm1.makeBasis(ax.f, new THREE.Vector3().copy(ax.n).addScaledVector(ax.f, -ax.n.dot(ax.f)).normalize(), bz).invert();
+  _hq.setFromRotationMatrix(_hm2.multiply(_hm1));                        // мировой поворот кисти
+  hd.parent.getWorldQuaternion(_iq3); _iq3.invert().multiply(_hq);
+  hd.quaternion.slerp(_iq3, w);
+  hd.updateMatrixWorld(true);
+}
+function hatAxis(out) {              // ось головы (от кости головы к месту верхушки шляпы), нормированная
+  hat.head.getWorldPosition(_hax);
+  return hat.head.localToWorld(out.copy(hatFall.apex)).sub(_hax).normalize();
+}
+function aimBoneMax(bone, from, to, w, maxA) {
+  // как aimBone, но поворот не больше maxA радиан: при почти обратных направлениях кратчайший поворот
+  // «прыгает» (ось вращения не определена) — от этого кисть рябила в разные стороны
+  bone.getWorldPosition(_iv);
+  const cur = _tmpA.copy(from).sub(_iv), want = _tmpB.copy(to).sub(_iv);
+  if (cur.lengthSq() < 1e-8 || want.lengthSq() < 1e-8) return;
+  cur.normalize(); want.normalize();
+  const ang = Math.acos(Math.max(-1, Math.min(1, cur.dot(want))));
+  _iq.setFromUnitVectors(cur, want);
+  if (ang > maxA) _iq.slerp(_iq3.identity(), 1 - maxA / ang);
+  bone.getWorldQuaternion(_iq2);
+  _iq.multiply(_iq2);
+  bone.parent.getWorldQuaternion(_iq3);
+  _iq3.invert().multiply(_iq);
+  bone.quaternion.slerp(_iq3, w);
+  bone.updateMatrixWorld(true);
 }
 
 // ---------- Посох (Аква Хартия) и водная магия ----------
@@ -2087,6 +2470,8 @@ function setupHat() {
   best.updateMatrixWorld(true);
   hat.tipInHead = hat.head.worldToLocal(best.localToWorld(tip.clone()));
   hat.mesh = best;
+  // у новой модели у тульи свои пружинные кости (J_Sec_C_HatCrown*) — шейдерная мягкость не нужна
+  if (vrm.scene.getObjectByName('J_Sec_C_HatCrown1')) { hat.bones = true; console.log('🎩 у шляпы свои кости (тулья и кончик)'); return; }
   for (const m of [].concat(best.material)) {
     if (!m) continue;
     const prev = m.onBeforeCompile;
@@ -2108,11 +2493,17 @@ function setupHat() {
 // Для полёта — неподвижная копия шляпы в системе головы; настоящую шляпу на это время прячем (её треугольники
 // в индексе заменяются вырожденными, лента — скрывается).
 const HAT_DROP_P = params.get('hatdrop') !== null ? Math.max(0, Math.min(1, +params.get('hatdrop') || 0)) : 0.3;
-const hatFall = { st: 'on', obj: null, parts: [], minY: 0.1, brimC: new THREE.Vector3(),
+const HAT_GRAB_T = 1.3;                       // пальцы сомкнулись на верхушке
+const HAT_NEAR = 0.85, HAT_BACK = 0.4, HAT_DOWN = 0.45;   // перед лицо; назад над голову; вниз на голову
+const HAT_ON_T = HAT_GRAB_T + 0.05 + HAT_NEAR + HAT_BACK + HAT_DOWN + 0.1;   // шляпа на голове, пальцы разжимаются
+const HAT_UP_T = HAT_ON_T + 0.3;
+const HAT_ROLL = +(params.get('hatroll') || -1);   // знак наклона головы к руке (проверено замером: так верхушка ближе к плечу)              // и только потом встаёт
+const hatFall = { st: 'on', obj: null, parts: [], minY: 0.1, brimC: new THREE.Vector3(), apex: new THREE.Vector3(),
+                  gA: new THREE.Vector3(), gQ: new THREE.Quaternion(), gOff: new THREE.Vector3(), A: new THREE.Vector3(), u1: 0, u2: 0,
                   t: 0, v: new THREE.Vector3(), spin: new THREE.Vector3(), side: 'right', grabbed: false,
                   off: new THREE.Matrix4(), from: { p: new THREE.Vector3(), q: new THREE.Quaternion() } };
 const _hfM = new THREE.Matrix4(), _hfP = new THREE.Vector3(), _hfQ = new THREE.Quaternion(), _hfS = new THREE.Vector3(),
-      _hfQ2 = new THREE.Quaternion(), _hfE = new THREE.Euler();
+      _hfQ2 = new THREE.Quaternion(), _hfE = new THREE.Euler(), _hfAxZ = new THREE.Vector3(0, 0, 1);
 function setupHatFall() {
   const hm = hat.mesh, head = hat.head;
   if (!hm || !head || !hm.geometry.index) return;
@@ -2134,12 +2525,29 @@ function setupHatFall() {
     for (const n of ['position', 'normal', 'uv']) if (g.attributes[n]) geo.setAttribute(n, g.attributes[n].clone());
     geo.setIndex(keep); geo.applyMatrix4(M);
     const gp = geo.attributes.position;
-    for (const vi of keep) { _p.fromBufferAttribute(gp, vi); bmin.min(_p); bmax.max(_p); }
+    for (const vi of keep) {
+      _p.fromBufferAttribute(gp, vi); bmin.min(_p); bmax.max(_p);
+      if (cast && _p.y > hatFall.apex.y) hatFall.apex.copy(_p);           // верхушка тульи — за неё и берёт
+    }
     const m = new THREE.Mesh(geo, [].concat(o.material)[0]); m.castShadow = cast; obj.add(m);
     hatFall.parts.push({ idx, idx0: a.slice(), tris });
   };
   take(hm, true);
   if (!hatFall.parts.length || hatFall.parts[0].tris.length < 50) { hatFall.parts = []; return; }
+  // где держат пальцы: бок тульи в 6 см под верхушкой (слева и справа). За самую верхушку рука, надевая шляпу,
+  // вытягивалась в струну — локоть уходил в тулью, а у прямой руки кисть дёргалась
+  {
+    const gm = obj.children[0].geometry.attributes.position, yy = hatFall.apex.y - 0.06 * H / 1.75;
+    let lo = null, hi = null;
+    for (let i = 0; i < gm.count; i++) {
+      _p.fromBufferAttribute(gm, i);
+      if (Math.abs(_p.y - yy) > 0.012 || Math.abs(_p.z - hatFall.apex.z) > 0.04) continue;
+      if (!lo || _p.x < lo.x) lo = _p.clone();
+      if (!hi || _p.x > hi.x) hi = _p.clone();
+    }
+    hatFall.grips = lo && hi ? [lo, hi] : [hatFall.apex.clone(), hatFall.apex.clone()];
+    hatFall.grip = hatFall.grips[0];
+  }
   vrm.scene.traverse(o => {           // лента шляпы (HAIR_03)
     if (o.isSkinnedMesh && o !== hm && /HAIR_03/.test(([].concat(o.material)[0] || {}).name || '')) take(o, false);
   });
@@ -2147,6 +2555,14 @@ function setupHatFall() {
   hatFall.brimC.set((bmin.x + bmax.x) / 2, bmin.y + 0.01, (bmin.z + bmax.z) / 2);
   hatFall.obj = obj;
   console.log(`🎩 шляпа может слетать (треугольников: ${hatFall.parts.reduce((n, q) => n + q.tris.length, 0)}, высота ${(bmax.y - bmin.y).toFixed(2)} м, шанс при жёстком приземлении ${Math.round(HAT_DROP_P * 100)} %)`);
+}
+const _pp = new THREE.Vector3();
+function pinchPoint(side, out) {     // точка щепоти: подушечка большого + средние фаланги указательного и среднего
+  const h = vrm.humanoid, a = h.getRawBoneNode(side + 'ThumbDistal'), b = h.getRawBoneNode(side + 'IndexIntermediate'),
+        c = h.getRawBoneNode(side + 'MiddleIntermediate');
+  if (!a || !b || !c) return h.getRawBoneNode(side + 'Hand').getWorldPosition(out);
+  a.getWorldPosition(out); out.add(b.getWorldPosition(_pp)); out.add(c.getWorldPosition(_pp));
+  return out.multiplyScalar(1 / 3);
 }
 function hatShown(on) {
   for (const q of hatFall.parts) {
@@ -2156,14 +2572,15 @@ function hatShown(on) {
     q.idx.needsUpdate = true;
   }
 }
-function dropHat(why) {
+function dropHat(why, gentle) {
   if (hatFall.st !== 'on' || !hatFall.obj || sitting || held || !vrm) return false;
   vrm.scene.updateMatrixWorld(true);
   hat.head.matrixWorld.decompose(hatFall.obj.position, hatFall.obj.quaternion, _hfS);
   scene.add(hatFall.obj);
   hatShown(false);
   const side = Math.random() < 0.5 ? -1 : 1;
-  hatFall.v.set(side * (0.35 + 0.35 * Math.random()), 1.7 + 0.6 * Math.random(), 0.25 + 0.2 * Math.random()).multiplyScalar(H / 1.75);
+  if (gentle) hatFall.v.set(side * (0.7 + 0.3 * Math.random()), 0.3, -0.1).multiplyScalar(H / 1.75);   // сползла с головы и откатилась вбок
+  else hatFall.v.set(side * (0.25 + 0.25 * Math.random()), 1.7 + 0.6 * Math.random(), 0.3 + 0.2 * Math.random()).multiplyScalar(H / 1.75);
   hatFall.spin.set((Math.random() - 0.5) * 6, (Math.random() - 0.5) * 4, side * (3 + 3 * Math.random()));
   hatFall.st = 'fly'; hatFall.t = 0; hatFall.grabbed = false;
   hat.off.set(0, 0, 0); hat.vel.set(0, 0, 0);
@@ -2174,7 +2591,7 @@ function dropHat(why) {
 function hatBackOn() {                // на голову сразу (её взяли на руки, посадили на окно и т.п.)
   if (hatFall.st === 'on' || !hatFall.obj) return;
   if (hatFall.obj.parent) hatFall.obj.parent.remove(hatFall.obj);
-  hatShown(true); hatFall.st = 'on';
+  hatShown(true); hatFall.st = 'on'; hatFall.placed = false;
 }
 function updateHatFall(dt) {
   const f = hatFall, o = f.obj;
@@ -2185,9 +2602,10 @@ function updateHatFall(dt) {
     f.v.y -= 9.8 * dt;
     o.position.addScaledVector(f.v, dt);
     _hfQ.setFromEuler(_hfE.set(f.spin.x * dt, f.spin.y * dt, f.spin.z * dt)); o.quaternion.multiply(_hfQ);
-    const lim = 0.24 * H / 1.75, cx = root.position.x;            // не улетает за край окна
+    // не улетает за край окна и далеко от неё: присев, она должна дотянуться до верхушки рукой
+    const lim = (acro ? 0.4 : 0.15) * H / 1.75, cx = root.position.x;
     if (Math.abs(o.position.x - cx) > lim) { o.position.x = cx + Math.sign(o.position.x - cx) * lim; f.v.x *= -0.4; }
-    if (o.position.z > 0.3 * H / 1.75) { o.position.z = 0.3 * H / 1.75; f.v.z *= -0.4; }
+    if (o.position.z - root.position.z > 0.3 * H / 1.75) { o.position.z = root.position.z + 0.3 * H / 1.75; f.v.z *= -0.4; }
     const gy = -f.minY;                                               // поля на полу
     if (o.position.y <= gy && f.v.y < 0) {
       o.position.y = gy; f.v.y *= -0.3; f.v.x *= 0.45; f.v.z *= 0.45; f.spin.multiplyScalar(0.4);
@@ -2196,44 +2614,72 @@ function updateHatFall(dt) {
     return;
   }
   if (f.st === 'ground') {
-    // ложится полями на пол, сохраняя поворот вокруг вертикали
-    _hfE.setFromQuaternion(o.quaternion, 'YXZ'); _hfQ2.setFromEuler(_hfE.set(0, _hfE.y, 0, 'YXZ'));
+    // ложится полями на пол и докатывается, разворачиваясь так же, как стоит она (бок тульи — к её руке)
+    hat.head.getWorldQuaternion(_hfQ2); _hfE.setFromQuaternion(_hfQ2, 'YXZ'); _hfQ2.setFromEuler(_hfE.set(0, _hfE.y, 0, 'YXZ'));
     o.quaternion.slerp(_hfQ2, Math.min(1, dt * 6));
     o.position.y += (-f.minY - o.position.y) * Math.min(1, dt * 8);
-    if (f.t > 0.8 && !held && w.air < 0.05 && !anim) {
+    // поля (25 см) не должны лежать на её ступнях: шляпа откатывается чуть вперёд
+    const zMin = root.position.z + 0.26 * H / 1.75;
+    if (o.position.z < zMin) o.position.z += (zMin - o.position.z) * Math.min(1, dt * 5);
+    if (f.t > 0.8 && !held && w.air < 0.05 && !anim && !acro) {
       // какой рукой: шляпа слева от неё — левой
       vrm.scene.updateMatrixWorld(true);
       const lh = vrm.humanoid.getRawBoneNode('leftHand'), rh = vrm.humanoid.getRawBoneNode('rightHand');
       const hp = o.position;
       f.side = lh && rh && lh.getWorldPosition(_hfP).distanceTo(hp) < rh.getWorldPosition(_hfS).distanceTo(hp) ? 'left' : 'right';
-      f.st = 'pick'; f.t = 0; lastActivity = time;
+      // бок тульи со стороны этой руки (какая из двух точек на голове ближе к её плечу)
+      const sh = vrm.humanoid.getRawBoneNode(f.side + 'UpperArm').getWorldPosition(_hfP);
+      const d0 = hat.head.localToWorld(_hfS.copy(f.grips[0])).distanceTo(sh), d1 = hat.head.localToWorld(_hfS.copy(f.grips[1])).distanceTo(sh);
+      f.grip = d0 < d1 ? f.grips[0] : f.grips[1];
+      f.st = 'pick'; f.t = 0; f.placed = false; f.u1 = f.u2 = f.uA = f.uB = f.uC = 0; f.tS = null; lastActivity = time;
     }
     return;
   }
   if (f.st === 'pick') {
     const hand = vrm.humanoid.getRawBoneNode(f.side + 'Hand');
     if (held && !f.grabbed) { f.st = 'ground'; f.t = 0; return; }
-    if (!f.grabbed && f.t >= 1.35 && hand) {                       // взяла: дальше шляпа едет вместе с кистью
+    // щепоть: между подушечкой большого и средними фалангами указательного и среднего
+    if (hand) {
+      pinchPoint(f.side, _hfP);
+      hand.getWorldPosition(_hfS);
+      _hfS.sub(_hfP);                                                  // щепоть → запястье
+      if (f.t < 0.05) f.gOff.copy(_hfS); else f.gOff.lerp(_hfS, 0.5);
+    }
+    if (!f.grabbed && f.t >= HAT_GRAB_T && hand) {
       o.updateMatrixWorld(true);
-      f.off.copy(hand.matrixWorld).invert().multiply(o.matrixWorld);
+      o.localToWorld(f.gA.copy(f.grip)); f.gQ.copy(o.quaternion); f.gP = o.position.clone(); f.grabT = f.t;
       f.grabbed = true;
     }
+    const t0 = f.t - HAT_GRAB_T - 0.05;
+    f.uA = smooth(t0 / HAT_NEAR); f.uB = smooth((t0 - HAT_NEAR) / HAT_BACK); f.uC = smooth((t0 - HAT_NEAR - HAT_BACK) / HAT_DOWN);
+    f.u1 = f.uA; f.u2 = f.uC;
+    if (f.placed) {                                                 // шляпа на голове — пальцы разжаты, встаёт
+      if (f.t >= HAT_UP_T + 1.05 || held) { f.st = 'on'; f.placed = false; }
+      return;
+    }
     if (f.grabbed && hand) {
-      _hfM.multiplyMatrices(hand.matrixWorld, f.off).decompose(_hfP, _hfQ, _hfS);
-      const s = smooth((f.t - 2.3) / 0.85);                          // последние ~0.8 с — плавно точно на голову
-      if (s > 0) {
-        hat.head.matrixWorld.decompose(f.from.p, f.from.q, _hfS);
-        _hfP.lerp(f.from.p, s); _hfQ.slerp(f.from.q, s);
-      }
+      // верхушка — в щепоти: шляпа висит на пальцах и едет за ними; пока подносит к голове,
+      // поворачивается в положение «на голове» (голова наклонена — и шляпа так же)
+      pinchPoint(f.side, _hfP);
+      hat.head.matrixWorld.decompose(f.from.p, f.from.q, _hfS);
+      _hfQ.copy(f.gQ).slerp(f.from.q, smooth(Math.min(1, f.u1 * 1.2)));
+      _hfP.sub(_hfS.copy(f.grip).applyQuaternion(_hfQ));
+      const s = smooth((f.t - (HAT_ON_T - 0.3)) / 0.3);             // последние 0.3 с — точно на голову
+      if (s > 0) { _hfP.lerp(f.from.p, s); _hfQ.slerp(f.from.q, s); }
+      const g = smooth((f.t - f.grabT) / 0.3);                      // без рывка в момент хвата
+      if (g < 1) _hfP.lerp(f.gP, 1 - g);
       o.position.copy(_hfP); o.quaternion.copy(_hfQ);
-      if (f.t >= 3.15) { hatBackOn(); console.log('🎩 шляпа снова на голове'); }
+      if (f.t >= HAT_ON_T) {
+        if (o.parent) o.parent.remove(o);
+        hatShown(true); f.placed = true; console.log('🎩 шляпа снова на голове');
+      }
     }
     if (held && f.grabbed) hatBackOn();
   }
 }
-window._petBusy = () => hatFall.st !== 'on';
+window._petBusy = () => hatFall.st !== 'on' || !!acro || !!flip;
 function updateHat(dt) {
-  if (!hat.mesh || dt <= 0) return;
+  if (!hat.mesh || hat.bones || dt <= 0) return;
   if (hatFall.st !== 'on') { hat.u.uHatOff.value.set(0, 0, 0); hat.off.set(0, 0, 0); hat.vel.set(0, 0, 0); hat.prev = null; return; }
   hat.head.updateWorldMatrix(true, false);
   const tip = _hv.copy(hat.tipInHead).applyMatrix4(hat.head.matrixWorld);
@@ -2593,7 +3039,9 @@ function updateClothCollide() {
     _cm4.copy(c.mesh.matrixWorld).invert();
     c.u.uBodyA.value.copy(_cb1).applyMatrix4(_cm4); c.u.uBodyB.value.copy(_cb2).applyMatrix4(_cm4);   // ось тела
     c.u.uFwd.value.set(Math.sin(root.rotation.y), 0, Math.cos(root.rotation.y)).transformDirection(_cm4);   // куда смотрит
-    c.u.uHB.value = stW.handsBack || 0;
+    // «руки за спиной» в шейдере плаща — только когда поза правда применена: сидя на окне stW.handsBack
+    // оставался 1 (поза запомнилась стоя), и плащ выдвигался вперёд и вылезал рваными кусками у плеч
+    c.u.uHB.value = stApp.hb || 0;
     for (let k = 0; k < 4; k++) {
       c.u.uSegA.value[k].copy(clothCol.segA[k]).applyMatrix4(_cm4);
       c.u.uSegB.value[k].copy(clothCol.segB[k]).applyMatrix4(_cm4);
@@ -2710,7 +3158,7 @@ let hoverAt = -99, calmLog = '', calmLogAt = -99;
 function calmCap() {
   let c = FPS_CAP;
   if (IDLE_FPS && vrm && !POSETEST) {
-    const busy = anim || gesture || gest || react || hops.length || walking || held || heldW > 0.01 || w.air > 0.01
+    const busy = anim || acro || flip || mdW > 0.01 || gesture || gest || react || hops.length || walking || held || heldW > 0.01 || w.air > 0.01
       || airT >= 0 || crouchT >= 0 || landT >= 0 || mouthTarget > 0.05 || mouth > 0.05 || (lean && leanT < 2)
       || w.walk > 0.02 || edge || Math.abs(edgeW - (edge ? 1 : 0)) > 0.02 || Math.abs(w.sit - (sitting ? 1 : 0)) > 0.02 || hat.vel.lengthSq() > 0.0004
       || Math.abs(winM.vx) + Math.abs(winM.vy) > 0.01 || time - hoverAt < 3 || time - lastActivity < 4 || hatFall.st !== 'on';
@@ -2752,6 +3200,7 @@ function frame(now) {
     }
     vrm.update(dt);
     vrm.scene.updateMatrixWorld(true);
+    try { acroMeasure(); acroCloth(dt); } catch (e) { if (!window._acroErr) { window._acroErr = 1; console.log('acro: ' + e); } }
     updateHat(dt);
     updateHatFall(dt);
     try { if (edgeHold > 0.01) { holdEdgeHands(edgeHold); } edgeHold = 0; } catch (e) { console.log('edge hands: ' + e); }
@@ -2806,6 +3255,7 @@ window.roxyLive2D = {
   play(name) { play(name); },
   land(strength) {
     airT = -1; crouchT = -1; landT = 0; landK = strength || 1; lastActivity = time;
+    if (flip) flip.land = time;
     if ((strength || 1) >= 0.8 && Math.random() < HAT_DROP_P) setTimeout(() => dropHat('жёсткое приземление'), 80);
     if (reliefPending) {
       reliefPending = false; if (reliefTimer) { clearTimeout(reliefTimer); reliefTimer = null; }
@@ -2813,6 +3263,15 @@ window.roxyLive2D = {
     }
   },
   air() { airT = 0; crouchT = -1; lastActivity = time; },
+  acro(type, dir, distPx) {
+    if (sitting || held || airT >= 0 || acro || (type !== 'handstand' && type !== 'cartwheel')) return '0';
+    const ppm = 0.70 * window.innerHeight / H;
+    acro = { type, t: 0, dur: type === 'handstand' ? HS_DUR : CW_DUR, dir: +dir < 0 ? -1 : 1, D: Math.max(0, +distPx || 0) / ppm };
+    anim = null; gesture = null; mdance = false; lastActivity = time;
+    return '1';
+  },
+  acroCarryDone() { acroCarry = 0; },
+  flip(dur) { airT = 0; crouchT = -1; flip = { t: 0, dur: Math.max(0.6, +dur || 0.95) }; anim = null; lastActivity = time; },
   dropHat() { return dropHat('команда') ? '1' : '0'; },
   crouch() { crouchT = 0; lastActivity = time; },
   setSitting(on) { sitting = !!on; },
@@ -2856,15 +3315,20 @@ window.roxyLive2D = {
     wallX = (+wallPx - window.innerWidth / 2) / ppm;
     lean = side; leanT = 0; facing = -side; anim = null; lastActivity = time;
   },
-  winPos(x, y) {
-    // позиция окна на экране (логические px). Скачок > 400 px (показали/спрятали окно) — не движение
+  winPos(x, y, ts) {
+    // позиция окна на экране (логические px). Скачок > 400 px (показали/спрятали окно) — не движение.
+    // ts — время отправки (мс, часы Python): сообщения приходят пачками, и по времени ПРИХОДА скорость
+    // скакала вдвое-вчетверо (dt между двумя сообщениями одной пачки ~0) — от этих скачков «ускорения»
+    // дёргались руки, корпус и плащ на ходу
     x = +x; y = +y;
+    const now = (+ts > 0 ? +ts : performance.now()) / 1000;
     if (winM.x !== null) {
-      const dx = x - winM.x, dy = y - winM.y, now = performance.now() / 1000, dtp = Math.max(0.008, now - winM.t);
-      if (Math.abs(dx) < 400 && Math.abs(dy) < 400) { winM.rawx = dx / dtp; winM.rawy = dy / dtp; }
-      winM.t = now;
-    } else winM.t = performance.now() / 1000;
-    winM.x = x; winM.y = y; winM.seen = 1;
+      const dx = x - winM.x, dy = y - winM.y, dtp = Math.max(0.008, now - winM.t);
+      if (Math.abs(dx) < 400 && Math.abs(dy) < 400 && dtp < 0.5) { winM.rawx = dx / dtp; winM.rawy = dy / dtp; }
+      if (acroCarry) { root.position.x -= dx / (0.70 * window.innerHeight / H); winM.rawx = 0; }   // окно подъехало — тело на месте экрана
+    }
+    winM.t = now;
+    winM.x = x; winM.y = y; winM.seen = 1; winM.recv = performance.now() / 1000;
   },
   dragMove(vx) { if (held) dragVx += Math.max(-4000, Math.min(4000, +vx || 0)); },
   idle() {
@@ -2875,6 +3339,15 @@ window.roxyLive2D = {
                    : r < 0.8 ? 'staff_lean' : r < 0.9 ? 'staff_twirl' : 'magic'));   // посох — и просто так, и поколдовать
   },
   setFacing(dir) { facing = dir < 0 ? -1 : 1; },
+  setMusic(st) {                              // {on, bpm, phase, energy} из music.py
+    if (!st || typeof st !== 'object') return;
+    if (st.on && st.bpm > 0) {
+      if (Math.abs((musicSt.bpm || 0) - st.bpm) > 6) beatPh = st.phase;          // новый темп — сразу на долю
+      else { let d = st.phase - beatPh; d -= Math.round(d); beatPh = ((beatPh + 0.35 * d) % 1 + 1) % 1; }
+    }
+    musicSt = { ...musicSt, ...st, bpm: st.on && st.bpm > 0 ? st.bpm : musicSt.bpm };
+  },
+  setMusicDance(on) { mdance = !!on; if (mdance) { anim = null; lean = 0; edge = null; lastActivity = time; } },
   setEdge(mode, dir, wallPx) {
     // игра с окнами: mode 'peek' — выглядывает в сторону dir из-за края, 'push' — толкает окно; '' — закончить.
     // wallPx — где край в координатах окна Рокси

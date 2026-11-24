@@ -43,7 +43,8 @@ PORT = 8765
 ALLOWED_EMOTIONS = {"neutral", "happy", "sad", "angry", "surprised", "shy", "smug"}
 BEHAVIORS = {"jump", "perch", "floor", "come", "walk", "nod", "shake", "autonomy_on", "autonomy_off",
              "dance", "spin", "bow", "stretch", "yawn", "look_around", "lean", "magic", "peek", "hide", "push",
-             "magic_orb", "magic_ice", "magic_rain", "magic_fountain", "staff_lean", "staff_twirl"}
+             "magic_orb", "magic_ice", "magic_rain", "magic_fountain", "staff_lean", "staff_twirl",
+             "dance_music", "dance_stop", "flip", "handstand", "cartwheel"}
 PERCH_SINK = 0.36     # сидит: ноги спрятаны «за край окна», на краю — юбка; на окне «сидит»: низ модели (ноги, юбка) свешивается ниже края окна на 22% роста
 PERCH_SINK_MAX = 0.72  # если окно стоит высоко — садится «глубже» (ноги перед окном), но не больше 60% роста
 
@@ -259,6 +260,7 @@ class TypeBubble(QWidget):
 
 
 class Live2DWindow(QMainWindow):
+    music_sig = Signal(dict)         # состояние музыки из потока music.MusicWatcher
     js_signal = Signal(str)
     behavior_signal = Signal(str)
     key_signal = Signal(str)
@@ -363,7 +365,11 @@ class Live2DWindow(QMainWindow):
         self._placed = False
         self._phys = QTimer(self)
         self._phys.timeout.connect(self._tick)
-        self._phys.start(33)
+        # 60 Гц и точный таймер: при 33 мс обычный таймер Windows срабатывал то через 31, то через 47 мс —
+        # окно ехало неровными рывками, и на ходу Рокси «дёргалась как курица»
+        self._phys.setTimerType(Qt.PreciseTimer)
+        self._phys.start(16)
+        self._walk_pause = False
         self._brain = QTimer(self)
         self._brain.setSingleShot(True)
         self._brain.timeout.connect(self._think)
@@ -371,6 +377,20 @@ class Live2DWindow(QMainWindow):
 
         self.drag_pos = None
         self._behind_hwnd = None     # прячется за этим окном (Рокси на время не «поверх всех»)
+        # танец под музыку: None | "cmd" (попросили) | "auto" (сама); состояние музыки — из music.py
+        self._mdance = None
+        self._music = {"on": False}
+        self._music_off_since = None
+        self._mdance_until = 0.0
+        self._mdance_cool = 0.0
+        self._mdance_wait = None
+        self.music_sig.connect(self._on_music)
+        try:
+            import music
+            self._music_thread = music.MusicWatcher(self.music_sig.emit)
+            self._music_thread.start()
+        except Exception as e:
+            print(f"🎵 танец под музыку недоступен: {e}", flush=True)
         self._edge = None            # игра с окнами: что сейчас делает (см. _edge_*)
 
     # ==================== клавиши ====================
@@ -548,10 +568,11 @@ class Live2DWindow(QMainWindow):
     def moveEvent(self, event):
         super().moveEvent(event)
         now = time.monotonic()
-        if now - getattr(self, "_winpos_t", 0.0) >= 0.015:          # не чаще ~60 раз в секунду
+        if now - getattr(self, "_winpos_t", 0.0) >= 0.012:          # не чаще ~80 раз в секунду
             self._winpos_t = now
             p = self.pos()
-            self._js(f"winPos({p.x()},{p.y()})")
+            # с временем отправки: страница считает скорость по нему, а не по времени прихода (приходят пачками)
+            self._js(f"winPos({p.x()},{p.y()},{now * 1000:.1f})")
 
     # ==================== сторож мигания ====================
     def _start_flicker_watch(self):
@@ -599,6 +620,7 @@ class Live2DWindow(QMainWindow):
     def mousePressEvent(self, event):
         if event.button() == Qt.LeftButton:
             self._edge_abort()
+            self._mdance_stop("взяли мышкой")
             self.drag_pos = event.globalPosition().toPoint()
             self._press_pos = QPoint(self.drag_pos)
             self._press_t = time.monotonic()
@@ -882,6 +904,48 @@ class Live2DWindow(QMainWindow):
                 self._js("air()")
             QTimer.singleShot(260, launch)             # присед виден — потом толчок
 
+    def _flip(self, power=1250.0):
+        """Сальто назад: присела → сильный толчок вверх → страница крутит её в воздухе за время полёта."""
+        if self.mode not in ("idle", "perch", "walk"):
+            return
+        self._set_walking(False)
+        self._js("crouch()")
+        self.mode = "prep"
+
+        def launch():
+            if self.mode != "prep":
+                return
+            self.mode = "air"
+            self.vy = -power
+            self.vx = 0.0
+            self._js("setSitting(false)")
+            self._js(f"flip({2 * power / GRAVITY:.2f})")     # время полёта до того же уровня
+        QTimer.singleShot(300, launch)
+
+    ACRO_DUR = {"handstand": 6.0, "cartwheel": 2.4}   # как в vrm.html (HS_DUR, CW_DUR)
+
+    def _acro(self, name):
+        """Стойка на руках — на месте; колесо — окно едет в сторону, где больше места (как в странице: та же
+        плавная кривая, что и поворот тела, — ступни и кисти не скользят)."""
+        if self.mode not in ("idle", "walk") or self.land_on is not None:
+            return                                         # сидя на окне и в полёте — нет
+        self._set_walking(False)
+        f = self._feet()
+        d = 1
+        dist = 0.0
+        if name == "cartwheel" and f:
+            # Окно во время колеса НЕ двигается (перемещение прозрачного окна дёргалось — колесо шло рывками):
+            # тело катится внутри окна на ~четверть роста, а потом окно плавно подъезжает под неё,
+            # а страница в ту же секунду сдвигает тело обратно (на глаз она просто стоит).
+            dist = min(0.25 * f[3], 0.2 * self.width())
+            right = self._clamp_x(self.px + dist) - self.px
+            left = self.px - self._clamp_x(self.px - dist)
+            d = 1 if right >= left else -1
+            dist = max(right, left)
+        self._acro_x0, self._acro_d, self._acro_t, self._acro_name = self.px, d * dist, 0.0, name
+        self.mode = "acro"
+        self._js(f"acro('{name}', {d}, {dist:.0f})")
+
     def _jump_to(self, tx, ty_floor, hwnd, flight=0.75):
         """Прыжок по дуге в точку (tx — x окна, ty_floor — y окна в точке приземления)."""
         self._set_walking(False)
@@ -904,6 +968,7 @@ class Live2DWindow(QMainWindow):
         self.after_walk = then
         self.vx = WALK_SPEED if tx > self.px else -WALK_SPEED
         self.mode = "walk"
+        self._walk_pause = False
         self._set_walking(True, self.vx)
 
     def _perch(self):
@@ -942,9 +1007,14 @@ class Live2DWindow(QMainWindow):
             self._dozing = False
             self._js("setDoze(false)")                # любая команда будит
         print(f"🐾 {name} (режим: {self.mode}, модель {'найдена' if self._feet() else 'ЕЩЁ НЕ ИЗМЕРЕНА'})", flush=True)
-        if self.mode == "drag" or not self._feet():
+        if self.mode in ("drag", "acro") or not self._feet():
             return
         self._edge_abort()
+        if name == "dance_music":
+            return self._mdance_cmd()
+        if name == "dance_stop":
+            return self._mdance_stop("попросили")
+        self._mdance_stop("другая команда")
         if name == "autonomy_on":
             self.autonomy = True
             if self.mode == "idle" and self.land_on is None:
@@ -968,6 +1038,12 @@ class Live2DWindow(QMainWindow):
                 return
             self._jump()
             self._js("hop(1)")
+        elif name == "flip":
+            if self.mode == "air":
+                return
+            self._flip()
+        elif name in ("handstand", "cartwheel"):
+            self._acro(name)
         elif name == "perch":
             if not self._perch():
                 self._js("gesture('shake')")      # некуда садиться
@@ -1231,15 +1307,85 @@ class Live2DWindow(QMainWindow):
             _user32.SetWindowPos(ctypes.c_void_p(int(self.winId())), ctypes.c_void_p(-1), 0, 0, 0, 0, 0x0001 | 0x0002 | 0x0010)
         self._behind_hwnd = None
 
+    # ==================== танец под музыку ====================
+    def _music_on_cfg(self):
+        try:
+            from settings import live_config
+            return bool(live_config("music_dance", True))
+        except Exception:
+            return bool(load_config().get("music_dance", True))
+
+    def _can_dance(self):
+        return self.mode in ("idle",) and self.land_on is None and not self._edge
+
+    def _on_music(self, st):
+        self._music = st
+        now = time.monotonic()
+        if self._mdance:
+            self._js(f"setMusic({json.dumps(st)})")
+            if st.get("on"):
+                self._music_off_since = None
+            else:
+                self._music_off_since = self._music_off_since or now
+                if now - self._music_off_since > 2.5:
+                    self._mdance_stop("музыка закончилась")
+            if self._mdance == "auto" and now > self._mdance_until:
+                self._mdance_stop("натанцевалась")
+                self._mdance_cool = now + 60
+            return
+        if self._mdance_wait is not None:                       # попросили, ждём, пока найдётся такт
+            if st.get("on"):
+                self._mdance_wait = None
+                self._mdance_start("cmd")
+            elif now > self._mdance_wait:
+                self._mdance_wait = None
+                print("🎵 музыки не слышно — танцую просто так", flush=True)
+                self._js("play('dance')")
+            return
+        # сама: музыка играет уже 6 с, она стоит без дела — иногда пускается в пляс
+        if (st.get("on") and st.get("for", 0) > 6 and self.autonomy and self._music_on_cfg() and self._can_dance()
+                and now > self._mdance_cool and not getattr(self, "_dozing", False) and random.random() < 0.06):
+            self._mdance_start("auto")
+
+    def _mdance_cmd(self):
+        if self.mode == "perch":                                # сначала слезть
+            self.land_on = None
+            self._fall(vy=-500)
+        if self._music.get("on"):
+            self._mdance_start("cmd")
+        else:
+            self._mdance_wait = time.monotonic() + 4.0
+
+    def _mdance_start(self, why):
+        if not self._can_dance():
+            if why == "cmd":
+                QTimer.singleShot(1500, lambda: self._mdance_start(why) if self._can_dance() else None)
+            return
+        self._mdance = why
+        self._music_off_since = None
+        self._mdance_until = time.monotonic() + random.uniform(40, 90)
+        self._set_walking(False)
+        self._js(f"setMusic({json.dumps(self._music)})")
+        self._js("setMusicDance(true)")
+        print(f"💃 танцует под музыку ({'попросили' if why == 'cmd' else 'сама'}, {self._music.get('bpm', 0)} уд/мин)", flush=True)
+
+    def _mdance_stop(self, why=""):
+        self._mdance_wait = None
+        if not self._mdance:
+            return
+        self._mdance = None
+        self._js("setMusicDance(false)")
+        print(f"💃 перестала танцевать ({why})", flush=True)
+
     def _schedule_think(self):
         self._brain.start(random.randint(15000, 45000))
 
     def _think(self):
         """Сама по себе: иногда гуляет, прыгает, садится на окна."""
         self._schedule_think()
-        if not self.autonomy or self.mode in ("drag", "air", "walk", "prep") or time.monotonic() - self.last_talk < 3:
+        if not self.autonomy or self.mode in ("drag", "air", "walk", "prep", "acro") or time.monotonic() - self.last_talk < 3:
             return
-        if getattr(self, "_avatar_busy", False) or self._edge:   # подбирает шляпу / играет с окнами — не мешать
+        if getattr(self, "_avatar_busy", False) or self._edge or self._mdance:   # шляпа / окна / танцует — не мешать
             return
         # ночью (23:00–6:00), если 3 минуты никто не говорил и не трогал — дремлет и никуда не ходит.
         # Будят: голос, перетаскивание, клик, поглаживание, любая команда.
@@ -1271,6 +1417,9 @@ class Live2DWindow(QMainWindow):
             self.do_behavior("lean")
         elif r < 0.67:
             self.do_behavior(random.choice(("peek", "hide")))   # игра с окнами (толкать окна — только по просьбе)
+        elif r < 0.695 and self.land_on is None:
+            # изредка (~2–3 % раздумий) — трюк сама: сальто, колесо или стойка на руках
+            self.do_behavior(random.choice(("flip", "cartwheel", "handstand")))
         elif r < 0.90:
             self._js("idle()")
         else:
@@ -1286,8 +1435,33 @@ class Live2DWindow(QMainWindow):
                 if fy is not None and abs(self.py - fy) > 8:
                     self._fall()
             return
-        if time.monotonic() - self.last_talk < 0.5 and self.mode == "walk":
-            return                                         # пока говорит — стоит
+        if self.mode == "acro":
+            self._acro_t += dt
+            dur = self.ACRO_DUR.get(self._acro_name, 2.0)
+            if self._acro_t >= dur + 0.1:
+                # подвезти окно под неё (колесо) — за 0.9 с, страница компенсирует по winPos
+                rc = self._acro_t - dur - 0.1
+                s = min(1.0, rc / 0.9)
+                self.px = self._acro_x0 + self._acro_d * s * s * (3 - 2 * s)
+                self.move(int(round(self.px)), int(self.py))
+                if s >= 1.0:
+                    self.mode = "idle"
+                    p = self.pos()                                  # последний сдвиг мог не уйти (moveEvent реже 12 мс)
+                    self._js(f"winPos({p.x()},{p.y()},{time.monotonic() * 1000:.1f})")
+                    self._js("acroCarryDone()")
+            return
+        if self.mode == "walk":
+            # пока говорит — стоит. Раньше окно замирало на каждом слове, а ноги продолжали шагать: между словами
+            # оно снова ехало — рывки в такт речи. Теперь останавливается целиком и идёт дальше после паузы в речи.
+            quiet = time.monotonic() - self.last_talk
+            if quiet < 0.5 or (self._walk_pause and quiet < 1.2):
+                if not self._walk_pause:
+                    self._walk_pause = True
+                    self._set_walking(False)
+                return
+            if self._walk_pause:
+                self._walk_pause = False
+                self._set_walking(True)
         if self.mode == "walk":
             self._walk_t = getattr(self, "_walk_t", 0.0) + dt
             # ровная скорость: раньше окно ехало «толчками» с частотой, не связанной с шагами модели,

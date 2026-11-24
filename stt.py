@@ -122,10 +122,40 @@ class Mic:
             except Exception:
                 pass
 
+    @staticmethod
+    def _device():
+        """Микрофон из лаунчера (config «mic_device» — имя устройства); не нашли — системный по умолчанию."""
+        try:
+            from settings import live_config
+            name = (live_config("mic_device", "") or "").strip()
+        except Exception:
+            name = ""
+        if not name:
+            return None
+        try:
+            for i, d in enumerate(sd.query_devices()):
+                if d.get("max_input_channels", 0) > 0 and d.get("name") == name:
+                    return i
+            for i, d in enumerate(sd.query_devices()):     # имя могло чуть поменяться (другой порт USB)
+                if d.get("max_input_channels", 0) > 0 and name.lower() in d.get("name", "").lower():
+                    return i
+        except Exception:
+            pass
+        print(f"⚠️ Микрофон «{name}» не найден — беру системный по умолчанию")
+        return None
+
     def start(self):
         if self._stream is None:
-            self._stream = sd.RawInputStream(samplerate=SR, blocksize=BLOCK, channels=1,
-                                             dtype="int16", callback=self._cb)
+            dev = self._device()
+            try:
+                self._stream = sd.RawInputStream(samplerate=SR, blocksize=BLOCK, channels=1, device=dev,
+                                                 dtype="int16", callback=self._cb)
+            except Exception as e:
+                if dev is None:
+                    raise
+                print(f"⚠️ Выбранный микрофон не открылся ({e}) — беру системный по умолчанию")
+                self._stream = sd.RawInputStream(samplerate=SR, blocksize=BLOCK, channels=1,
+                                                 dtype="int16", callback=self._cb)
             self._stream.start()
             self.last_block_at = time.monotonic()
 
