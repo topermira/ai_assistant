@@ -435,6 +435,14 @@ def _canonical(name, a):
     return None
 
 
+def router_phrase_ok(name, phrase, user_text):
+    """«сдвинь на 100» роутер превращал в «громкость 100» и выкручивал звук. Громкость — только если в исходной фразе
+    действительно есть слова про звук."""
+    if name == "media" and (phrase or "").startswith("громкость"):
+        return bool(re.search(r"громк|звук|тише|громче|volume", (user_text or "").lower()))
+    return True
+
+
 def llm_route(user_text):
     """→ (intent, task) или None (= обычный чат)."""
     import intents
@@ -452,6 +460,9 @@ def llm_route(user_text):
                 args = {}
             phrase = _canonical(fn.name, args)
             print(f"🧭 Роутер: {fn.name} → «{phrase}»")
+            if phrase and not router_phrase_ok(fn.name, phrase, user_text):
+                print("🧭 Роутер: фраза не про громкость, игнорирую")
+                return None
             if phrase:
                 intent, task = intents.get_intent(phrase, code_analyzer=None, llm_router=None)
                 if intent == "[ACTION_CODE_FILE]" and not task:

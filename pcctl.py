@@ -14,7 +14,8 @@ import subprocess
 # ---------------------------------------------------------------- мышь
 _MOUSE = r"(?:мыш\w*|курсор\w*|указател\w*)"
 _MOVE_VERB = r"(?:перенеси|перемести|переместь|подвинь|сдвинь|передвинь|двинь|переведи|отведи|убери|поставь|наведи|опусти|подними)"
-_RE_MOVE = re.compile(rf"\b{_MOVE_VERB}\s+(?:мне\s+)?{_MOUSE}|\b{_MOUSE}\s+{_MOVE_VERB}|\b{_MOUSE}\s+(?:в|на)\s+(?:центр|середин|угол|лев|прав|верх|низ)")
+_RE_MOVE = re.compile(rf"\b{_MOVE_VERB}\s+(?:мне\s+)?{_MOUSE}|\b{_MOUSE}\s+{_MOVE_VERB}|\b{_MOUSE}\s+(?:в|на)\s+(?:центр|середин|угол|лев|прав|верх|низ)"
+                      rf"|\b{_MOUSE}\s+(?:на\s+\d+\s*(?:пикс\w*|px|точ\w*)?\s+)?(?:вниз|ниже|вверх|выше|влево|налево|левее|вправо|направо|правее)\b")
 _DIRS = {"вниз": (0, 1), "ниже": (0, 1), "вверх": (0, -1), "выше": (0, -1), "влево": (-1, 0), "налево": (-1, 0),
          "левее": (-1, 0), "вправо": (1, 0), "направо": (1, 0), "правее": (1, 0)}
 _RE_STEP = re.compile(r"(?:на\s+(\d+)\s*(?:пикс\w*|px|точ\w*)?\s+)?(вниз|ниже|вверх|выше|влево|налево|левее|вправо|направо|правее)"
@@ -100,6 +101,19 @@ _BARE_OK = re.compile(r"^(?:на|и|ещё|еще|рокси|мне|её|ее|е
                       r"вниз|ниже|вверх|выше|влево|налево|левее|вправо|направо|правее)$")
 
 
+_NODIR_VERB = re.compile(r"^(?:перенеси|перемести|подвинь|сдвинь|передвинь|двинь|сместь|смести)$")
+
+
+def _bare_nodir(text):
+    """«сдвинь на 100» — шаг есть, направления нет. Раньше это уходило в LLM-роутер и превращалось в «громкость 100»."""
+    words = re.findall(r"[a-zа-яё0-9]+", text)
+    if not any(_NODIR_VERB.match(w) for w in words) or not any(w.isdigit() for w in words):
+        return False
+    if any(w in _DIRS for w in words):
+        return False
+    return all(_NODIR_VERB.match(w) or _BARE_OK.match(w) for w in words)
+
+
 def _bare_move(text):
     """«передвинь на 300 пикселей вниз» — без слова «мышку». Только если во фразе нет ничего постороннего
     (иначе «сдвинь окно влево» стало бы движением курсора)."""
@@ -177,6 +191,8 @@ def parse_mouse(lower):
     if c:
         return c
     lower = words_to_digits(lower)
+    if _bare_nodir(lower):
+        return ("ask",)
     if not _RE_MOVE.search(lower) and not _bare_move(lower):
         return None
     if re.search(r"\b(?:в\s+)?(?:центр|середин)", lower):
@@ -234,6 +250,8 @@ def mouse(task):
     pyautogui.FAILSAFE = False                  # угол экрана — законная цель, а не аварийный стоп
     try:
         kind = task[0]
+        if kind == "ask":
+            return "Куда сдвинуть курсор: вверх, вниз, влево или вправо? Скажи, например: «сдвинь на 100 вниз»."
         if kind == "move":
             _, dx, dy = task
             x, y = pyautogui.position()

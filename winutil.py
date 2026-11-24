@@ -18,6 +18,7 @@ import pyperclip
 import pywinauto
 
 from settings import APP_DICT, DESKTOP_PATH
+import winalias
 
 try:
     import win32com.client as _win32com
@@ -210,6 +211,8 @@ def _launch_by_name(name):
     lnk = _find_start_menu_shortcut(name_low)
     if lnk:
         try:
+            shown = focus_if_running(lnk)
+            if shown: return True, f"уже открыто, показала окно «{shown}»"
             os.startfile(lnk)
             time.sleep(1.0)
             _bring_to_front(name, timeout=3.0)
@@ -899,11 +902,80 @@ def type_at_cursor(text):
 
 
 # ==================== ОКНА ====================
+def _window_cands(wins):
+    """Данные окон для winalias.pick_window: (заголовок, процесс, ширина, высота, свёрнуто)."""
+    res = []
+    for w in wins:
+        try:
+            h = getattr(w, "_hWnd", 0)
+            res.append(((w.title or ""), _window_process_name(h) if h else None, w.width, w.height, bool(w.isMinimized)))
+        except Exception:
+            res.append(("", None, 0, 0, False))
+    return res
+
+
 def _find_window_by_title(title):
+    """Окно по имени. Для известных программ («блокнот», «яндекс», «хром») ищем по процессу и по переводам
+    заголовка: на нидерландской Windows Блокнот называется «Kladblok», и «закрой блокнот» его не находила."""
     if not title: return None
+    try: wins = list(gw.getAllWindows())
+    except Exception: wins = []
+    exe = winalias.process_for(title)
+    if exe:
+        i = winalias.pick_window(_window_cands(wins), exe)
+        if i is not None: return wins[i]
+    for n in winalias.needles(title):
+        ws = [w for w in wins if n in (w.title or "").lower()]
+        if ws: return ws[0]
     ws = gw.getWindowsWithTitle(title)
-    if not ws: ws = [w for w in gw.getAllWindows() if title.lower() in (w.title or "").lower()]
     return ws[0] if ws else None
+
+
+def window_minimized(win):
+    """Окно реально свёрнуто (или спрятано), а не просто «команда отправлена»."""
+    h = getattr(win, "_hWnd", 0)
+    try:
+        if h: return bool(_user32.IsIconic(h)) or not _user32.IsWindowVisible(h)
+        return bool(win.isMinimized)
+    except Exception:
+        return True
+
+
+def focus_existing_app(exe_name):
+    """Если у программы уже есть окно — вывести его вперёд (свёрнутое восстановить) и вернуть заголовок, иначе None.
+    Нужно, чтобы «открой яндекс» не плодила новые окна браузера."""
+    exe = (exe_name or "").lower()
+    if not exe: return None
+    try: wins = list(gw.getAllWindows())
+    except Exception: return None
+    i = winalias.pick_window(_window_cands(wins), exe)
+    if i is None: return None
+    w = wins[i]
+    try:
+        if w.isMinimized: w.restore()
+    except Exception: pass
+    hwnd = getattr(w, "_hWnd", None)
+    if hwnd: _force_foreground(hwnd)
+    return w.title
+
+
+def shortcut_target(lnk):
+    """Что запускает ярлык (.lnk) → путь к exe или None."""
+    try:
+        import win32com.client
+        return win32com.client.Dispatch("WScript.Shell").CreateShortCut(lnk).Targetpath or None
+    except Exception:
+        return None
+
+
+def focus_if_running(path):
+    """Для ярлыка/exe программы, которая уже открыта: показать её окно. Возвращает заголовок или None
+    (тогда программу нужно запускать). Проводник, консоли, Блокнот и Paint не трогаем — там новое окно ожидаемо."""
+    p = (path or "")
+    exe = os.path.basename(shortcut_target(p) or "").lower() if p.lower().endswith(".lnk") else os.path.basename(p).lower()
+    if not exe.endswith(".exe") or exe in winalias.MULTI_WINDOW_EXES:
+        return None
+    return focus_existing_app(exe)
 
 def _safe_maximize(win):
     if win is None: return False

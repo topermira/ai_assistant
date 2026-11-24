@@ -17,6 +17,8 @@ from PySide6.QtWidgets import QApplication, QMainWindow, QSystemTrayIcon, QMenu,
 from PySide6.QtWebEngineWidgets import QWebEngineView
 from PySide6.QtWebEngineCore import QWebEnginePage
 
+_DEBUG = bool(os.environ.get("ROXY_DEBUG"))      # подробные служебные строки — только для отладки
+
 
 class _Page(QWebEnginePage):
     """Печатает console.log / ошибки JavaScript в консоль main.py (раньше Qt их молча глотал)."""
@@ -26,7 +28,9 @@ class _Page(QWebEnginePage):
         key = (message, line)
         n = self._seen.get(key, 0)
         self._seen[key] = n + 1
-        if n < 3:                                   # одинаковые ошибки каждый кадр — не спамим
+        # обычные console.log (шляпа, «файла кружева нет» и т.п.) — только в режиме отладки; предупреждения и ошибки показываем всегда
+        if n < 3 and (_DEBUG or level != QWebEnginePage.JavaScriptConsoleMessageLevel.InfoMessageLevel
+                      or message.startswith(("⚠", "❌"))):
             print(f"[JS:{line}] {message}", flush=True)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -738,7 +742,8 @@ class Live2DWindow(QMainWindow):
                 bbox = json.loads(bbox)
             except ValueError:
                 pass
-        if isinstance(bbox, dict) and bbox.get("err") and not getattr(self, "_warned_err", False):
+        # «model not loaded» — модель просто ещё грузится; если так и не загрузится, скажет предупреждение ниже
+        if isinstance(bbox, dict) and bbox.get("err") and bbox["err"] != "model not loaded" and not getattr(self, "_warned_err", False):
             self._warned_err = True
             print(f"⚠️ Live2D bounds: {bbox['err']}", flush=True)
         if not isinstance(bbox, dict) or bbox.get('w', 0) <= 0 or bbox.get('h', 0) <= 0:
@@ -1006,7 +1011,6 @@ class Live2DWindow(QMainWindow):
         if getattr(self, "_dozing", False) and name not in ("autonomy_on", "autonomy_off"):
             self._dozing = False
             self._js("setDoze(false)")                # любая команда будит
-        print(f"🐾 {name} (режим: {self.mode}, модель {'найдена' if self._feet() else 'ЕЩЁ НЕ ИЗМЕРЕНА'})", flush=True)
         if self.mode in ("drag", "acro") or not self._feet():
             return
         self._edge_abort()

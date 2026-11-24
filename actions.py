@@ -14,13 +14,15 @@ import audio
 import gui
 from settings import APP_DICT, DESKTOP_PATH, PROJECT_DIR
 from intents import (_RE_DELETE_FILE, _RE_CLEAR_FOLDER, _RE_MAXIMIZE_FULL, _RE_WINDOW, _RE_HERE,
-                     _RE_EXPLICIT_FOLDER, _FOLDER_KW, _WINDOW_NOISE, _WINDOW_NOISE_PREFIX, _clean_folder_query)
+                     _RE_EXPLICIT_FOLDER, _FOLDER_KW, _WINDOW_NOISE, _WINDOW_NOISE_PREFIX, _clean_folder_query,
+                     create_name)
 from winutil import (_force_foreground, _bring_to_front, _focus_new_app, _launch_by_name, _press_win_d,
                      _press_hotkey, _find_folder, _find_file, _open_path, _send_to_trash, _clear_folder_contents,
                      count_folder_items, get_active_explorer_path, is_explorer_window, _clear_notepad,
                      insert_into_notepad, type_at_cursor, _find_window_by_title, _find_notepad_window,
                      set_text_if_empty, open_file_in_notepad, _safe_maximize, _close_all_windows, media_key,
-                     _window_process_name)
+                     _window_process_name, window_minimized, focus_existing_app, focus_if_running)
+import winalias
 from vision import _smart_find_target, execute_vision_task, read_screen_and_analyze
 from llm import think_llm, generate_code, clean_code, rewrite_message_for_contact, draft_tg_reply
 from library import find_work_in_library, play_library_work, make_work_id
@@ -326,8 +328,11 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
                 if not win: return "Нет активного окна."
             t = win.title
             if action == "сверни":
+                if window_minimized(win): return f"'{t}' уже свёрнуто."
                 win.minimize()
-                return f"Свернула '{t}'."
+                time.sleep(0.15)
+                if window_minimized(win): return f"Свернула '{t}'."
+                return f"Не получилось свернуть '{t}': это окно не сворачивается."
             elif action == "разверни":
                 if win.isMinimized:
                     win.restore()
@@ -504,7 +509,8 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         else:
             task = (p[0], p[1] if len(p) > 1 else "center")
         result = pcctl.mouse(task)
-        _screen_after(ctx, delay=0.6 if p[0] in ("click", "cell") else 0.25)
+        if p[0] != "ask":                          # на уточняющий вопрос снимок экрана не нужен
+            _screen_after(ctx, delay=0.6 if p[0] in ("click", "cell") else 0.25)
         return result
 
     if intent == "[ACTION_KEYS]":
@@ -534,17 +540,7 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
     if intent == "[ACTION_CREATE]":
         is_folder = "папку" in lower
         use_current = bool(_RE_HERE.search(user_text))
-        nm = re.search(r"(?:с\s+(?:названием|именем)|назови|именем)\s+[«\"]?(.+?)[»\"]?\s*$", user_text, re.IGNORECASE)
-        if nm:
-            name = nm.group(1).strip()
-            name = re.sub(r" (?:на рабочем столе|файл|папку|блокнот|текстовик|документ|тут|здесь)", "", name, flags=re.IGNORECASE).strip()
-        else: name = ""
-        if not name:
-            # «создай файл Арс.txt», «создай папку проекты на рабочем столе», «файл список покупок в загрузках»
-            m2 = re.search(r"(?:папку|файл|блокнот|текстовик|документ)\s+(.+?)(?=\s+(?:в|на)\s+|\s+(?:тут|здесь)\b|\s*$)",
-                           user_text, re.IGNORECASE)
-            if m2: name = m2.group(1).strip()
-            if name.lower() in ("тут", "здесь"): name = ""
+        name = create_name(user_text)
         name = name.strip(" .,!?-\"«»")
         name = re.sub(r"\s+\.", ".", name)
         if not name: name = "Новая папка" if is_folder else "Новый файл"
@@ -628,6 +624,10 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         prog_lower = raw.lower().strip()
         if prog_lower in APP_DICT:
             try:
+                exe_b = os.path.basename(APP_DICT[prog_lower]).lower()
+                if exe_b in winalias.BROWSER_EXES:    # браузер уже открыт — просто показать, не открывать новое окно
+                    shown = focus_existing_app(exe_b)
+                    if shown: return f"{raw} уже открыт, показала окно."
                 subprocess.Popen(APP_DICT[prog_lower], shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
                 if APP_DICT[prog_lower].endswith(".exe") and " " not in APP_DICT[prog_lower]: _focus_new_app(APP_DICT[prog_lower], timeout=3.0)
                 else: _bring_to_front(raw, timeout=3.0)
@@ -662,6 +662,8 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         fp = _find_file(raw)
         if fp:
             try:
+                shown = focus_if_running(fp)          # программа уже открыта — показываем её окно, а не плодим новые
+                if shown: return f"'{raw}' уже открыт, показала окно '{shown}'."
                 os.startfile(fp)
                 return f"Открываю '{os.path.basename(fp)}'."
             except Exception: pass
