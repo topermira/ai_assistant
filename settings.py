@@ -89,6 +89,7 @@ OPENROUTER_API_KEY = get_secret("OPENROUTER_API_KEY")
 GROQ_API_KEY = get_secret("GROQ_API_KEY")
 TG_API_ID = get_secret("TG_API_ID")
 TG_API_HASH = get_secret("TG_API_HASH")
+TG_BOT_TOKEN = get_secret("TG_BOT_TOKEN")        # свой бот от BotFather — управление с телефона (telegram_bot.py)
 
 # Какие обязательные ключи не заданы (main.py покажет понятное предупреждение).
 MISSING_SECRETS = [n for n, v in (("OPENROUTER_API_KEY", OPENROUTER_API_KEY),
@@ -177,12 +178,25 @@ def live_config(key, default=None):
 
 # Эти ключи меняет только лаунчер, и Рокси читает их на лету; её копия config в памяти могла устареть —
 # при сохранении из Рокси берём их с диска, иначе она бы откатывала громкость/микрофон из лаунчера.
-LAUNCHER_LIVE_KEYS = ("voice_volume", "mic_device", "music_dance")
+LAUNCHER_LIVE_KEYS = ("voice_volume", "mic_device", "music_dance", "end_silence", "tg_screen_after_mouse",
+                      "tg_notify_timers")
+ROXY_OWN_KEYS = ("tg_bot_owner",)
 
 
 def save_config(cfg, from_launcher=False):
     """Атомарная запись: сначала во временный файл, потом замена — обрыв посреди записи не портит config.json."""
     data = dict(cfg)
+    if from_launcher and os.path.exists(CONFIG_FILE):        # а эти пишет только Рокси — лаунчер их не затирает
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                disk = json.load(f)
+            for k in ROXY_OWN_KEYS:
+                if k in disk:
+                    data[k] = disk[k]
+                else:
+                    data.pop(k, None)
+        except Exception:
+            pass
     if not from_launcher and os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:

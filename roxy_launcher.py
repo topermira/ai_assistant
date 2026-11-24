@@ -83,6 +83,10 @@ SECTIONS = [
         ("rvc_worker", "Держать аниме-голос загруженным", "Отвечает быстрее, но занимает память", True),
         ("preload_whisper", "Заранее грузить распознавание речи", "Не ждать при плохом интернете", True),
     ]),
+    ("Телефон (Telegram)", [
+        ("tg_screen_after_mouse", "Снимок после мыши и клавиш", "Команда с телефона — сразу пришлёт экран с сеткой и курсором", True),
+        ("tg_notify_timers", "Таймеры и напоминания на телефон", "Сработал таймер — продублирует сообщением в чат", True),
+    ]),
     ("Приватность", [
         ("send_screenshots_to_cloud", "Скриншоты в облако без вопроса", "Для «глянь на экран»; выключено — спросит", False),
     ]),
@@ -464,7 +468,7 @@ QComboBox QAbstractItemView {{ background: #1c1f26; border: 1px solid {CARD_BORD
 """
 
 # настройки, которые Рокси подхватывает сама, без перезапуска
-LIVE_KEYS = {"voice_volume", "music_dance"}
+LIVE_KEYS = {"voice_volume", "music_dance", "end_silence", "tg_screen_after_mouse", "tg_notify_timers"}
 _MAPPER = re.compile(r"sound mapper|переназначение|первичный драйвер|primary sound", re.I)
 
 
@@ -657,6 +661,45 @@ class Launcher(QWidget):
         vh.setObjectName("rowSub")
         vh.setContentsMargins(14, 0, 14, 8)
         v.addWidget(vh)
+        v.addWidget(divider())
+
+        # пауза, после которой Рокси решает «договорил» (stt._end_silence, 0.7–4 с; читается на лету)
+        sr = QHBoxLayout()
+        sr.setContentsMargins(14, 10, 14, 4)
+        sr.setSpacing(12)
+        st = QLabel("Пауза перед ответом")
+        st.setObjectName("rowTitle")
+        self.sil = QSlider(Qt.Horizontal)
+        self.sil.setRange(7, 30)                      # десятые доли секунды: 0,7 … 3,0 с
+        self.sil.setSingleStep(1)
+        self.sil.setPageStep(2)
+        self.sil.setCursor(Qt.PointingHandCursor)
+        try:
+            cur_s = int(round(float(self.cfg.get("end_silence", 1.3)) * 10))
+        except (TypeError, ValueError):
+            cur_s = 13
+        self.sil.setValue(max(7, min(30, cur_s)))
+        fmt_s = lambda x: f"{x / 10:.1f} с".replace(".", ",")
+        self.sil_val = QLabel(fmt_s(self.sil.value()))
+        self.sil_val.setObjectName("pct")
+        self.sil_val.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        self._sil_timer = QTimer(self)
+        self._sil_timer.setSingleShot(True)
+        self._sil_timer.setInterval(250)
+        self._sil_timer.timeout.connect(lambda: self._set("end_silence", round(self.sil.value() / 10, 1)))
+        self.sil.valueChanged.connect(lambda x: (self.sil_val.setText(fmt_s(x)), self._sil_timer.start()))
+        for lbl in (vt, st):                           # оба ползунка начинаются с одной линии
+            lbl.setMinimumWidth(185)
+        sr.addWidget(st)
+        sr.addWidget(self.sil, 1)
+        sr.addWidget(self.sil_val)
+        v.addLayout(sr)
+        sh2 = QLabel("Сколько тишины ждать, чтобы понять, что ты договорил. Меньше — отвечает быстрее, "
+                     "но может перебить на паузе; меняется сразу")
+        sh2.setObjectName("rowSub")
+        sh2.setWordWrap(True)
+        sh2.setContentsMargins(14, 0, 14, 8)
+        v.addWidget(sh2)
         v.addWidget(divider())
 
         mr = QHBoxLayout()

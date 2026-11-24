@@ -20,6 +20,7 @@ import keyboard
 import audio
 import stt
 import bargein
+import latency
 import intents
 import llm
 from live2d_client import LIVE2D
@@ -37,12 +38,23 @@ _shutting_down = threading.Event()
 
 
 # ==================== РЕЧЬ ====================
+# Команда пришла из Telegram-бота: ответы уходят сообщением в чат, а не голосом (тебя у компьютера нет)
+_sink = threading.local()
+
+
+def _bot_reply():
+    return getattr(_sink, "reply", None)
+
+
 def say(text, default_emotion=None):
     """Озвучивает текст; тег эмоции ([happy] ...) уходит в Live2D, а не в TTS."""
     emotion, clean = extract_emotion(text or "")
     emotion = emotion or default_emotion
     if emotion:
         LIVE2D.emotion(emotion)
+    if _bot_reply():
+        _bot_reply()(clean)
+        return clean
     if clean and not bargein.pending():          # перебили голосом — остальное этой команды не договариваем
         with bargein.Monitor():
             audio.speak(clean, VOICE_MODE)
@@ -65,6 +77,9 @@ def say_stream(sentences, default_emotion=None):
                 _, sent = extract_emotion(sent or "")     # теги посреди ответа не озвучиваем
             if sent and sent.strip():
                 yield sent
+    if _bot_reply():
+        _bot_reply()(" ".join(gen()))
+        return True
     if bargein.pending():
         return False
     with bargein.Monitor():
@@ -73,6 +88,12 @@ def say_stream(sentences, default_emotion=None):
 
 def confirm(question):
     """Голосовое подтверждение. По умолчанию — НЕТ (молчание, непонятный ответ)."""
+    if getattr(_sink, "ask", None):                 # из Telegram — спрашиваем там же
+        _, q = extract_emotion(question)
+        verdict = intents.parse_yes_no(_sink.ask(q) or "")
+        if not verdict:
+            _sink.reply("Отменяю." if verdict is False else "Не дождалась ответа. Отменяю.")
+        return bool(verdict)
     say(question, default_emotion="surprised")
     for attempt in range(2):
         pre = bargein.take_pending()             # ответил, не дослушав вопрос, — это и есть ответ
@@ -90,8 +111,28 @@ def confirm(question):
     return False
 
 
+REMOTE = None          # управление с телефона (tg_remote.TgRemote), если подключено
+
+
+def _remote_channel():
+    """Для действий: куда слать файлы/снимки и пришла ли команда из чата.
+    Из чата — в тот же чат; голосом («пришли скриншот на телефон») — тоже в чат управления, если он есть."""
+    fn = getattr(_sink, "send_file", None)
+    if fn:
+        return fn, True
+    return (REMOTE.send_file if REMOTE else None), False
+
+
+def _notify_phone(text):
+    """Таймер/напоминание дублируем на телефон (config «tg_notify_timers», по умолчанию вкл) — вдруг ты не у компа."""
+    if REMOTE is None or not settings.live_config("tg_notify_timers", True):
+        return
+    threading.Thread(target=lambda: REMOTE.send(text), daemon=True, name="tg-notify").start()
+
+
 def _on_timer(message):
     print(f"⏰ {message}")
+    _notify_phone(f"⏰ {message}")
     # Весь сигнал + речь — под замком речи: sounddevice.play() останавливает предыдущее воспроизведение,
     # поэтому раньше таймер обрывал ответ Рокси на полуслове. Теперь он ждёт, пока она договорит.
     with audio._speech_lock:
@@ -101,7 +142,7 @@ def _on_timer(message):
 
 
 TIMERS = TimerManager(_on_timer, storage_path=os.path.join(settings.PROJECT_DIR, "timers.json"))
-CTX = ActionContext(config, confirm=confirm, timers=TIMERS)
+CTX = ActionContext(config, confirm=confirm, timers=TIMERS, remote=_remote_channel)
 
 
 # ==================== ГОРЯЧИЕ КЛАВИШИ ====================
@@ -134,10 +175,15 @@ def handle(text):
     intent, task = _get_intent(text)
     _current_intent = intent
     print(f"🧭 Intent: {intent}")
+    latency.mark("intent")
+    latency.note(intent)
 
     if intent == "[ACTION_STOP]":
         print("👋 СТОП.")
         LIVE2D.emotion("sad", 3000)
+        if getattr(_sink, "flush", None):
+            _sink.reply("Выключаюсь. Пока!")
+            _sink.flush()
         try:
             # прощание голосом Piper: офлайн и без RVC — выключение не ждёт интернета
             audio.speak("Выключаюсь. Пока!", "piper")
@@ -175,6 +221,8 @@ def handle(text):
             print(f"✅ {clean}")
             if intent not in intents._SILENT_INTENTS:
                 say(result)
+            elif _bot_reply():
+                _bot_reply()(clean)                          # молча — для голоса; в чат всё же ответим
             elif emotion:
                 LIVE2D.emotion(emotion)
             llm._push_history("user", text)
@@ -184,6 +232,7 @@ def handle(text):
         else:
             say(llm.think_llm(text, intent))
     finally:
+        latency.done()                                    # молчаливая команда — замер не «прилипнет» к следующему звуку
         if visible and intent not in ("[ACTION_SHOW_GUI]", "[ACTION_HIDE_GUI]"):
             gui.set_visible(True, force_foreground=_force_foreground)
 
@@ -231,6 +280,63 @@ def typed_loop():
             stt.PAUSE_WAKE.clear()
 
 
+# ==================== TELEGRAM-БОТ ====================
+def _bot_handle(text, reply, ask, flush, send_file=None):
+    print(f"📱 Из Telegram: {text}")
+    with _handle_lock:
+        _sink.reply, _sink.ask, _sink.flush, _sink.send_file = reply, ask, flush, send_file
+        try:
+            handle(_RE_TYPED_WAKE.sub("", text, count=1).strip() or text)
+        finally:
+            _sink.reply = _sink.ask = _sink.flush = _sink.send_file = None
+
+
+def _bot_set_owner(uid):
+    if uid is None:
+        config.pop("tg_bot_owner", None)
+    else:
+        config["tg_bot_owner"] = int(uid)
+    save_config(config)
+
+
+def _start_remote_account():
+    """Чат с ботом (или «Избранное»), который Рокси читает через ТВОЙ аккаунт (Telethon) — Bot API не нужен."""
+    chat = (config.get("tg_remote_chat", "RoxyAIAssistant_bot") or "").strip().lstrip("@")
+    if not chat or not _TELEGRAM_OK or not _tg_session_exists() or not get_tg_credentials(config)[0]:
+        return False
+    try:
+        from telegram_service import TG_SERVICE, _init_telegram_if_needed
+        ok, why = _init_telegram_if_needed(config)
+        if not ok:
+            print(f"⚠️ Управление с телефона: Telegram не подключился ({why})")
+            return False
+        global REMOTE
+        from tg_remote import TgRemote
+        r = TgRemote(TG_SERVICE, chat, _bot_handle)
+        r.start()
+        REMOTE = r
+        return True
+    except Exception as e:
+        print(f"⚠️ Управление с телефона через аккаунт: {type(e).__name__}: {e}")
+        return False
+
+
+def _start_bot():
+    def run():
+        # сначала через свой аккаунт (работает и там, где Bot API отвечает 429); не вышло — через Bot API.
+        # Одновременно оба не включаем: иначе одно сообщение боту выполнилось бы дважды.
+        if _start_remote_account():
+            return
+        if not settings.TG_BOT_TOKEN:
+            return
+        try:
+            from telegram_bot import RoxyBot
+            RoxyBot(settings.TG_BOT_TOKEN, _bot_handle, lambda: config.get("tg_bot_owner"), _bot_set_owner).start()
+        except Exception as e:
+            print(f"⚠️ Telegram-бот: {e}")
+    threading.Thread(target=run, daemon=True, name="tg-start").start()
+
+
 def assistant_loop():
     print("=== ROXY ===")
     print(f"Голос: {VOICE_MODE.upper()}")
@@ -251,7 +357,7 @@ def assistant_loop():
         try:
             pre = bargein.take_pending()
             if pre is not None:              # перебили голосом — сразу записываем, без «Рокси»
-                path = stt.record_command(pre, silence_timeout=2.0, no_speech_timeout=4.0)
+                path = stt.record_command(pre, no_speech_timeout=4.0)
                 text = stt.transcribe(path) if path else ""
                 if text:
                     print(f"👤 Ты сказал: {text}")
@@ -467,6 +573,7 @@ if __name__ == "__main__":
     threading.Thread(target=_warmup_models, daemon=True).start()
     threading.Thread(target=assistant_loop, daemon=True, name="assistant").start()
     threading.Thread(target=typed_loop, daemon=True, name="typed").start()
+    _start_bot()
     # после запуска остального: просроченные напоминания озвучатся с паузой, когда голос уже прогрет
     _pending, _overdue = TIMERS.restore(startup_delay=10.0)
     if _pending or _overdue:

@@ -149,6 +149,11 @@ def play(data, sr, lipsync=True, do_normalize=True):
     data = to_mono(data)
     if do_normalize:
         data = normalize(data)
+    try:
+        import latency
+        latency.first_sound()
+    except Exception:
+        pass
     vol = voice_volume()
     if vol != 1.0:
         data = np.clip(data * vol, -1.0, 1.0).astype(np.float32)

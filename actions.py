@@ -18,8 +18,9 @@ from intents import (_RE_DELETE_FILE, _RE_CLEAR_FOLDER, _RE_MAXIMIZE_FULL, _RE_W
 from winutil import (_force_foreground, _bring_to_front, _focus_new_app, _launch_by_name, _press_win_d,
                      _press_hotkey, _find_folder, _find_file, _open_path, _send_to_trash, _clear_folder_contents,
                      count_folder_items, get_active_explorer_path, is_explorer_window, _clear_notepad,
-                     insert_into_notepad, _find_window_by_title, _find_notepad_window,
-                     set_text_if_empty, open_file_in_notepad, _safe_maximize, _close_all_windows, media_key)
+                     insert_into_notepad, type_at_cursor, _find_window_by_title, _find_notepad_window,
+                     set_text_if_empty, open_file_in_notepad, _safe_maximize, _close_all_windows, media_key,
+                     _window_process_name)
 from vision import _smart_find_target, execute_vision_task, read_screen_and_analyze
 from llm import think_llm, generate_code, clean_code, rewrite_message_for_contact, draft_tg_reply
 from library import find_work_in_library, play_library_work, make_work_id
@@ -162,6 +163,11 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
     if intent == "[ACTION_HOTKEY]":
         if "|" not in extracted_task: return "Не поняла клавиши."
         keys, desc = extracted_task.split("|", 1)
+        if keys == "win+shift+s" and ctx.from_chat():          # с телефона «скрин» — это снимок в чат, а не «Ножницы»
+            return _phone_action(ctx, "screen")
+        if keys == "win+l":
+            import syscmd
+            return syscmd.lock()
         print(f"⌨️ {keys}")
         if keys == "alt+f4" and not ctx.confirm("Закрыть активную программу? Несохранённое пропадёт."):
             return "Не закрываю."
@@ -227,7 +233,7 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         win = gw.getActiveWindow()
         if not win or not win.title: return "Не вижу активного окна."
         t = win.title.lower()
-        if "блокнот" in t or "notepad" in t:
+        if "блокнот" in t or "notepad" in t or _window_process_name(getattr(win, "_hWnd", 0)) == "notepad.exe":
             if not ctx.confirm("Стереть весь текст в Блокноте?"):
                 return "Не трогаю."
             ok, _ = _clear_notepad()
@@ -477,6 +483,54 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         pyautogui.hotkey('ctrl', 'n')
         return "Новая вкладка."
 
+    if intent == "[ACTION_BRIGHTNESS]":
+        import pcctl
+        kind, _, n = (extracted_task or "query|0").partition("|")
+        return pcctl.brightness((kind, int(n or 0)))
+
+    if intent == "[ACTION_MOUSE]":
+        import pcctl
+        p = (extracted_task or "").split("|")
+        if p[0] == "move":
+            task = ("move", int(p[1]), int(p[2]))
+        elif p[0] == "click":
+            task = ("click", p[1], int(p[2]))
+        elif p[0] == "scroll":
+            task = ("scroll", int(p[1]))
+        elif p[0] == "cell":
+            task = ("cell", int(p[1]), int(p[2]), p[3], int(p[4]))
+        elif p[0] in ("down", "up"):
+            task = (p[0], p[1] if len(p) > 1 else ("left" if p[0] == "down" else "all"))
+        else:
+            task = (p[0], p[1] if len(p) > 1 else "center")
+        result = pcctl.mouse(task)
+        _screen_after(ctx, delay=0.6 if p[0] in ("click", "cell") else 0.25)
+        return result
+
+    if intent == "[ACTION_KEYS]":
+        import keys as keyboard_keys
+        combo, _, times = (extracted_task or "").partition("|")
+        if combo == "alt+f4" and not ctx.confirm("Закрыть активную программу? Несохранённое пропадёт."):
+            return "Не закрываю."
+        if combo == "win+l":
+            import syscmd
+            return syscmd.lock()
+        ok, msg = keyboard_keys.press(combo, int(times or 1))
+        if ok:
+            _screen_after(ctx, delay=0.5)
+        return msg
+
+    if intent == "[ACTION_SYS]":
+        return _sys_action(ctx, *(extracted_task or "").split("|", 1))
+
+    if intent == "[ACTION_PHONE]":
+        return _phone_action(ctx, *(extracted_task or "").split("|", 1))
+
+    if intent == "[ACTION_POWER]":
+        import power
+        kind, _, sec = (extracted_task or "").partition("|")
+        return power.run(kind, int(sec or 0), lambda q: ctx.confirm(q, force=True))
+
     if intent == "[ACTION_CREATE]":
         is_folder = "папку" in lower
         use_current = bool(_RE_HERE.search(user_text))
@@ -486,8 +540,11 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
             name = re.sub(r" (?:на рабочем столе|файл|папку|блокнот|текстовик|документ|тут|здесь)", "", name, flags=re.IGNORECASE).strip()
         else: name = ""
         if not name:
-            m2 = re.search(r"(?:папку|файл|блокнот|текстовик|документ)\s+([А-Яа-яЁёA-Za-z0-9_\-\.]+)(?=\s+(?:в|на)\s+)", user_text, re.IGNORECASE)
+            # «создай файл Арс.txt», «создай папку проекты на рабочем столе», «файл список покупок в загрузках»
+            m2 = re.search(r"(?:папку|файл|блокнот|текстовик|документ)\s+(.+?)(?=\s+(?:в|на)\s+|\s+(?:тут|здесь)\b|\s*$)",
+                           user_text, re.IGNORECASE)
             if m2: name = m2.group(1).strip()
+            if name.lower() in ("тут", "здесь"): name = ""
         name = name.strip(" .,!?-\"«»")
         name = re.sub(r"\s+\.", ".", name)
         if not name: name = "Новая папка" if is_folder else "Новый файл"
@@ -635,9 +692,23 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         t = m.group(1).strip()
         t = re.sub(r"^(?:сюда|тут|здесь|в\s+(?:текущ\w*\s+|это\s+|этом\s+|это\s+же\s+|открыт\w*\s+)?(?:блокнот\w*|проводник\w*|окн\w*|окошк\w*))\s+", "", t, flags=re.IGNORECASE)
         t = re.sub(r"^текст\w*[.,!?;:\s]+", "", t, flags=re.IGNORECASE)
+        t = re.sub(r"[,\s]+(?:в|во)\s+(?:\w+\s+)?(?:блокнот\w*|заметк\w*|текстовик\w*)\s*[.!]?\s*$", "", t, flags=re.IGNORECASE)
         t = t.lstrip(", ").strip()
         if not t: return "Не поняла, что вставлять."
         print(f"⌨️ {t[:80]}...")
+        from intents import type_target
+        if type_target(user_text.lower()) == "cursor":
+            ok, where = type_at_cursor(t)
+            if ok:
+                return f"Напечатала в «{where[:40]}»." if where != "unverified" else \
+                    "Напечатала. Если текста не видно — он в буфере, нажми Ctrl+V."
+            try:
+                pyperclip.copy(t)
+            except Exception:
+                pass
+            if where == "своё окно":
+                return "Сейчас активно моё окно — щёлкни туда, где нужно писать, и повтори. Текст пока в буфере."
+            return "Не вижу, куда печатать — поставь курсор в поле ввода. Текст в буфере, можно нажать Ctrl+V."
         ok, why = insert_into_notepad(t)
         if ok and why == "unverified":
             return "Напечатала. Если текста не видно — он в буфере, нажми Ctrl+V."
@@ -673,6 +744,100 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         return "Осталось: " + "; ".join(f"{left} — {msg}" for left, msg in items)
 
     return None
+
+
+def _screen_after(ctx, delay=0.4):
+    """Команда мышью/клавишами пришла с телефона — шлём снимок экрана с сеткой и курсором,
+    чтобы было видно, куда попало (config «tg_screen_after_mouse», по умолчанию вкл)."""
+    from settings import live_config
+    if not ctx.from_chat() or not live_config("tg_screen_after_mouse", True):
+        return
+    try:
+        import screengrid
+        time.sleep(delay)                     # меню после правого клика успевает открыться
+        data, cap = screengrid.screenshot(grid=True)
+        ctx.send_file(data, "screen.jpg", cap, photo=True)
+    except Exception as e:
+        print(f"⚠️ Снимок после действия: {type(e).__name__}: {e}")
+
+
+_NO_PHONE = ("Это работает через управление с телефона, а оно сейчас не подключено "
+             "(нужен Telegram-аккаунт и чат «tg_remote_chat» в config.json).")
+
+
+def _phone_action(ctx, kind, arg=""):
+    import phonefiles
+    if kind in ("screen", "grid"):
+        if not ctx.can_send_files():
+            return _NO_PHONE
+        import screengrid
+        data, cap = screengrid.screenshot(grid=(kind == "grid"))
+        ctx.send_file(data, "screen.jpg", cap, photo=True)
+        return "Скинула сетку." if kind == "grid" else "Скинула скриншот."
+
+    if kind == "clip_set":
+        pyperclip.copy(arg)
+        return "Положила в буфер обмена" + (f": «{arg[:40]}…»." if len(arg) > 40 else f": «{arg}».")
+
+    if kind == "clip_get":
+        what, val = phonefiles.clipboard_get()
+        if what == "empty":
+            return "В буфере обмена пусто (или там что-то, что я не умею прочитать)."
+        if what == "text":
+            return "В буфере:\n" + (val if len(val) <= 3500 else val[:3500] + "…\n(обрезала, всего " + str(len(val)) + " символов)")
+        if what == "files":
+            names = ", ".join(os.path.basename(f) for f in val[:10])
+            return f"В буфере файлы: {names}" + (f" и ещё {len(val) - 10}" if len(val) > 10 else "") + "."
+        if not ctx.can_send_files():
+            return "В буфере картинка. Показать её могу только в Telegram."
+        import io
+        buf = io.BytesIO()
+        val.convert("RGB").save(buf, "PNG")
+        ctx.send_file(buf.getvalue(), "clipboard.png", "Картинка из буфера", photo=False)
+        return "В буфере картинка — скинула её."
+
+    if kind == "file":
+        if not ctx.can_send_files():
+            return _NO_PHONE
+        path = _find_file(arg)
+        if not path:
+            return f"Не нашла «{arg}» на рабочем столе, в Документах, Загрузках и открытой папке."
+        if phonefiles.is_secret(path, PROJECT_DIR):
+            return f"«{os.path.basename(path)}» не отправляю: в таких файлах ключи и пароли."
+        size = os.path.getsize(path)
+        if size > phonefiles.MAX_BYTES:
+            return f"«{os.path.basename(path)}» слишком большой ({size // 1024 ** 2} МБ)."
+        ok = ctx.send_file(path, os.path.basename(path), os.path.basename(path))
+        return f"Скинула «{os.path.basename(path)}»." if ok else "Не получилось отправить файл."
+    return "Не поняла."
+
+
+def _sys_action(ctx, kind, arg=""):
+    import syscmd
+    if kind == "lock":
+        return syscmd.lock()
+    if kind == "sleep":
+        if not ctx.confirm("Перевести компьютер в сон? Разбудить его с телефона я не смогу.", force=True):
+            return "Не усыпляю."
+        syscmd.sleep_later(5.0)
+        return "Усыпляю компьютер через 5 секунд."
+    if kind == "status":
+        return syscmd.status()
+    if kind == "procs":
+        return syscmd.running_apps()
+    if kind == "kill":
+        exe = syscmd.resolve_proc(arg)
+        if not exe:
+            return f"Не знаю, как называется процесс «{arg}». Скажи по-английски, например «заверши chrome»."
+        if exe in syscmd.PROTECTED:
+            return f"{exe} — системный процесс, его не закрываю."
+        procs = syscmd.find_procs(exe)
+        if not procs:
+            return f"{exe} не запущен."
+        if not ctx.confirm(f"Принудительно закрыть {exe} ({len(procs)} проц.)? Несохранённое пропадёт.", force=True):
+            return "Не закрываю."
+        return syscmd.kill(exe, procs)
+    return "Не поняла."
 
 
 def _clear_folder_confirmed(ctx, folder):

@@ -5,6 +5,12 @@ LLM-части (анализ кода, роутер) передаются сна
 """
 import re
 
+import keys as keyboard_keys
+import pcctl
+import phonefiles
+import power
+import syscmd
+
 from volume import parse_volume_command
 
 # ==================== БАЗОВЫЕ ====================
@@ -266,7 +272,16 @@ _SILENT_INTENTS = {
     "[ACTION_LIBRARY]", "[ACTION_MEDIA]", "[ACTION_PET]",
 }
 
+_RE_TO_NOTEPAD = re.compile(r"блокнот|notepad|заметк|текстовик")
+
+
+def type_target(lower):
+    """Куда печатать по «напиши …»: 'notepad', если в фразе есть Блокнот/заметки, иначе 'cursor' — в активное окно."""
+    return "notepad" if _RE_TO_NOTEPAD.search(lower or "") else "cursor"
+
+
 ACTION_INTENTS = {
+    "[ACTION_POWER]", "[ACTION_BRIGHTNESS]", "[ACTION_MOUSE]", "[ACTION_KEYS]", "[ACTION_SYS]", "[ACTION_PHONE]",
     "[ACTION_OPEN]", "[ACTION_TYPE]", "[ACTION_CREATE]", "[ACTION_NEW_TAB]", "[ACTION_CODE_FILE]",
     "[ACTION_WINDOW]", "[ACTION_RENAME]", "[ACTION_MAXIMIZE_CURSOR]", "[ACTION_MAXIMIZE_FULL]",
     "[ACTION_SHOW_GUI]", "[ACTION_HIDE_GUI]", "[ACTION_CLEAR_TEXT]", "[ACTION_CLEAR_CONTEXT]",
@@ -365,6 +380,18 @@ def get_intent(user_text, library_lookup=None, code_analyzer=None, llm_router=No
         return "[CHAT]", ""
     if _RE_STOP.match(text): return "[ACTION_STOP]", ""
     lower = text.lower()
+    pw = power.parse(lower)                      # до «выключи звук» и «перезагрузи» (= F5)
+    if pw: return "[ACTION_POWER]", f"{pw[0]}|{pw[1]}"
+    br = pcctl.parse_brightness(lower)
+    if br: return "[ACTION_BRIGHTNESS]", f"{br[0]}|{br[1]}"
+    sc = syscmd.parse(lower)                     # блокировка, сон, состояние ПК, что запущено, «заверши хром»
+    if sc: return "[ACTION_SYS]", "|".join(sc)
+    pf = phonefiles.parse(text)                  # файлы/скриншоты/буфер ↔ телефон
+    if pf: return "[ACTION_PHONE]", "|".join(pf)
+    ms = pcctl.parse_mouse(lower)                # до vision-агента: «кликни» без цели — просто клик
+    if ms: return "[ACTION_MOUSE]", "|".join(str(x) for x in ms)
+    ks = keyboard_keys.parse_keys(lower)                  # «нажми Enter», «Ctrl+C» — после мыши («нажми правой» — клик)
+    if ks: return "[ACTION_KEYS]", f"{ks[0]}|{ks[1]}"
     if any(c in lower for c in _SCREEN_PHRASES) or _RE_SCREEN.search(lower): return "[ACTION_SCREEN]", text
     if _RE_CHAT_SHORT.match(lower) and len(lower) < 40 and not _RE_CHAT_SHORT_COMMAND.search(lower):
         return "[CHAT]", ""

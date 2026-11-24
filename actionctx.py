@@ -2,10 +2,39 @@
 
 
 class ActionContext:
-    def __init__(self, config, confirm=None, timers=None):
+    def __init__(self, config, confirm=None, timers=None, remote=None):
         self.config = config
         self._confirm = confirm
         self.timers = timers
+        self._remote = remote        # () -> (send_file | None, команда_из_чата: bool)
+
+    def from_chat(self):
+        """Команда пришла с телефона (из чата управления), а не голосом."""
+        try:
+            return bool(self._remote and self._remote()[1])
+        except Exception:
+            return False
+
+    def can_send_files(self):
+        try:
+            return bool(self._remote and self._remote()[0])
+        except Exception:
+            return False
+
+    def send_file(self, data, name, caption="", photo=False):
+        """Отправить в чат управления на телефоне. data — bytes или путь. → True, если ушло."""
+        try:
+            fn = self._remote and self._remote()[0]
+        except Exception:
+            fn = None
+        if not fn:
+            return False
+        try:
+            fn(data, name, caption, photo)
+            return True
+        except Exception as e:
+            print(f"⚠️ Отправка в Telegram: {type(e).__name__}: {e}")
+            return False
 
     def confirm(self, question, force=False):
         """«Да/нет» перед опасным действием.

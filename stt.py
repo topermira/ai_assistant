@@ -292,12 +292,24 @@ def wait_for_wake_word():
 
 
 # ==================== ЗАПИСЬ ====================
-def record_command(preroll=None, silence_timeout=3.0, no_speech_timeout=8.0, max_record=30.0, beep_fn=None):
-    """Пишет до 3 с тишины / Num Lock / лимита. Возвращает путь к wav или None."""
+def _end_silence():
+    """Сколько тишины ждать, чтобы решить «договорил» (config «end_silence», по умолчанию 1.3 с).
+    Было 3 с — это три секунды ожидания перед каждым ответом."""
+    try:
+        from settings import live_config
+        return max(0.7, min(4.0, float(live_config("end_silence", 1.3))))
+    except Exception:
+        return 1.3
+
+
+def record_command(preroll=None, silence_timeout=None, no_speech_timeout=8.0, max_record=30.0, beep_fn=None):
+    """Пишет до паузы в речи / Num Lock / лимита. Возвращает путь к wav или None."""
+    if silence_timeout is None:
+        silence_timeout = _end_silence()
     _rec_stop.clear()
     if beep_fn:
         beep_fn()
-    print("🔴 Говори! (Авто-стоп 3с тишины или Num Lock)")
+    print(f"🔴 Говори! (Авто-стоп {silence_timeout:.1f} с тишины или Num Lock)")
     chunks = list(preroll or [])
     has_spoken = False
     start = last_voice = time.monotonic()
@@ -311,7 +323,7 @@ def record_command(preroll=None, silence_timeout=3.0, no_speech_timeout=8.0, max
                 has_spoken = True
                 last_voice = now
         if has_spoken and now - last_voice > silence_timeout:
-            print(f"⏱ {silence_timeout:.0f}с тишины — стоп.")
+            print(f"⏱ {silence_timeout:.1f} с тишины — стоп.")
             break
         if not has_spoken and now - start > no_speech_timeout:
             print("🔇 Речь не обнаружена.")
@@ -329,6 +341,11 @@ def record_command(preroll=None, silence_timeout=3.0, no_speech_timeout=8.0, max
         print("🔇 Микрофон не уловил голос.")
         return None
     sf.write(TEMP_MIC_WAV, audio, SR)
+    try:
+        import latency
+        latency.start(last_voice, silence_timeout)
+    except Exception:
+        pass
     return TEMP_MIC_WAV
 
 
@@ -410,6 +427,11 @@ def transcribe(path, use_prompt=True):
     try:
         os.remove(path)
     except OSError:
+        pass
+    try:
+        import latency
+        latency.mark("stt")
+    except Exception:
         pass
     return (text or "").strip()
 

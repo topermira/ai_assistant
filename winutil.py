@@ -255,7 +255,8 @@ def _press_hotkey(keys):
     if keys == "win+d":
         if _press_win_d(): return True
     if keys == "win+r": return _press_win(0x52)
-    if keys == "win+l": return _press_win(0x4C)
+    if keys == "win+l":                       # имитацию Win+L Windows игнорирует — блокируем напрямую
+        return bool(_user32.LockWorkStation())
     if keys == "win+i": return _press_win(0x49)
     if keys == "win+v": return _press_win(0x56)
     if keys == "win+e":
@@ -589,15 +590,22 @@ def _find_notepad_window():
     """Окно Блокнота. Раньше подходило ЛЮБОЕ окно со словом «блокнот»/«notepad» в заголовке
     (вкладка браузера «Блокнот — Google Keep», Notepad++ и т.д.) и Рокси печатала не туда.
     Теперь предпочитаем окно процесса notepad.exe; если процесс определить не вышло — как раньше, по заголовку."""
+    # В Windows 11 у Блокнота в заголовке бывает только имя документа («Безымянный», «заметки.txt») —
+    # без слова «Блокнот». Раньше такое окно не находилось, и Рокси каждый раз открывала новый Блокнот,
+    # а текст оставляла в буфере. Теперь главное — процесс notepad.exe, заголовок не важен.
     fallback = None
     for w in gw.getAllWindows():
-        t = (w.title or "").lower()
-        if "блокнот" in t or "notepad" in t:
-            proc = _window_process_name(getattr(w, "_hWnd", 0))
-            if proc is None:
-                fallback = fallback or w
-            elif proc == "notepad.exe":
+        t = (w.title or "").strip()
+        if not t or not getattr(w, "_hWnd", 0):
+            continue
+        proc = _window_process_name(w._hWnd)
+        if proc == "notepad.exe":
+            if w.width > 50 and w.height > 50:
                 return w
+            continue
+        tl = t.lower()
+        if proc is None and ("блокнот" in tl or "notepad" in tl):
+            fallback = fallback or w
     return fallback
 
 def _click_into_notepad_text(win):
@@ -689,14 +697,13 @@ def _notepad_text(win):
         return None
 
 
-def _open_new_notepad(timeout=4.0):
+def _open_new_notepad(timeout=6.0):
     subprocess.Popen("notepad.exe")
     deadline = time.time() + timeout
     while time.time() < deadline:
         time.sleep(0.3)
         a = gw.getActiveWindow()
-        t = (getattr(a, "title", "") or "").lower()
-        if a and ("блокнот" in t or "notepad" in t):
+        if a and getattr(a, "_hWnd", 0) and _window_process_name(a._hWnd) == "notepad.exe":
             return a
     return _find_notepad_window()
 
@@ -857,6 +864,38 @@ def insert_into_notepad(text, fresh=False):
 
 # Старое имя — для совместимости
 _set_notepad_text = insert_into_notepad
+
+# Окна, куда текст «в позицию курсора» вставлять бессмысленно: рабочий стол, панель задач, Пуск, Проводник
+_NO_TEXT_CLASSES = {"Progman", "WorkerW", "Shell_TrayWnd", "Shell_SecondaryTrayWnd", "CabinetWClass",
+                    "ExploreWClass", "Windows.UI.Core.CoreWindow", "XamlExplorerHostIslandWindow"}
+
+
+def _window_pid(hwnd):
+    from ctypes import wintypes
+    pid = wintypes.DWORD()
+    _user32.GetWindowThreadProcessId(wintypes.HWND(hwnd), ctypes.byref(pid))
+    return pid.value
+
+
+def type_at_cursor(text):
+    """Вставляет текст туда, где сейчас стоит курсор (в активное окно), без поиска Блокнота.
+    → (True, название окна) | (False, причина). Если окно — Блокнот, идём обычным путём с проверкой вставки."""
+    hwnd = _user32.GetForegroundWindow()
+    if not hwnd:
+        return False, "нет активного окна"
+    if _window_pid(hwnd) == os.getpid():
+        return False, "своё окно"                  # активно окно Рокси (аватар) — печатать некуда
+    if _window_class(hwnd) in _NO_TEXT_CLASSES:
+        return False, "не текстовое окно"
+    proc = _window_process_name(hwnd) or ""
+    if proc == "notepad.exe":
+        ok, why = insert_into_notepad(text)
+        return ok, ("Блокнот" if ok and why != "unverified" else why)
+    buf = ctypes.create_unicode_buffer(256)
+    _user32.GetWindowTextW(hwnd, buf, 256)
+    title = (buf.value or proc or "окно").strip()
+    _paste(text)                                    # Ctrl+V в активное окно, старый буфер вернётся через 1 с
+    return True, title
 
 
 # ==================== ОКНА ====================
