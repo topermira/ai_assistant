@@ -1,24 +1,24 @@
-MIT License
+Copyright (c) 2026 topermira. All rights reserved.
 
-Copyright (c) 2026 topermira
+This repository is published publicly for viewing and evaluation only
+(for example, as a portfolio). No license is granted to use, copy, modify,
+merge, publish, distribute, sublicense or sell the software or any part of it,
+in source or binary form, without prior written permission from the copyright
+holder.
 
-Permission is hereby granted, free of charge, to any person obtaining a copy
-of this software and associated documentation files (the "Software"), to deal
-in the Software without restriction, including without limitation the rights
-to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
-copies of the Software, and to permit persons to whom the Software is
-furnished to do so, subject to the following conditions:
+Viewing the code on GitHub and forking it within GitHub as permitted by the
+GitHub Terms of Service does not grant any of the rights listed above.
 
-The above copyright notice and this permission notice shall be included in all
-copies or substantial portions of the Software.
+Third-party libraries, models and voices used by this project (VRM avatar,
+Piper, Whisper, Vosk, RVC and others) are not part of this repository and are
+covered by their own licenses.
 
-THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
-AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-SOFTWARE.
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND.
 
-Note: third-party models and voices (VRM avatar, Piper, Whisper, Vosk, RVC) are
-not part of this repository and are covered by their own licenses.
+---
+
+Copyright (c) 2026 topermira. Все права защищены.
+
+Код открыт только для просмотра и оценки (например, как портфолио).
+Использовать, копировать, изменять, распространять или продавать его целиком
+или по частям без письменного разрешения автора нельзя.
