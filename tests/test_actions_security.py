@@ -89,9 +89,33 @@ def test_find_file_marks_fuzzy_matches(fake_desktop):
     assert wu._find_file_ex("отчет2.docx") == (str(desk / "отчет2.docx"), False)
     assert wu._find_file_ex("отчет1.docx") == (str(desk / "отчет2.docx"), True)    # другое имя — только похожее
     assert wu._find_file_ex("телеграм") == (str(desk / "Телеграм.lnk"), False)     # отличается лишь расширение
-    assert wu._find_file_ex("документ") == (str(desk / "документ.exe"), False)
+    assert wu._find_file_ex("документ") == (str(desk / "документ.exe"), True)      # программа — как похожее
+    (desk / "документ.pdf").write_text("x", encoding="utf-8")
+    assert wu._find_file_ex("документ") == (str(desk / "документ.pdf"), False)     # документ важнее программы
     assert wu._find_file_ex("совсем другое") == (None, False)
     assert wu._find_file("отчет1.docx") == str(desk / "отчет2.docx")              # старое имя — как раньше
+    import pathsafe
+    assert pathsafe.is_program("x.EXE") and pathsafe.is_program("run.ps1") and pathsafe.is_program("setup.msi")
+    assert not pathsafe.is_program("Телеграм.lnk") and not pathsafe.is_program("отчёт.docx")
+
+
+def test_same_name_program_asks_shortcut_and_document_do_not(actions_mod, fake_desktop, monkeypatch):
+    wu, desk = fake_desktop
+    monkeypatch.setattr(actions_mod, "APP_DICT", {})          # «телеграм» здесь — ярлык, а не команда из APP_DICT
+    monkeypatch.setattr(actions_mod, "focus_if_running", lambda p: None)
+    started = []
+    monkeypatch.setattr(actions_mod.os, "startfile", lambda p: started.append(p), raising=False)
+    ctx, asked = _ctx(actions_mod, False, cfg={"confirm_dangerous": False})
+    open_ = lambda what: actions_mod.execute_pc_action("[ACTION_OPEN]", f"открой {what}", "", ctx)
+    (desk / "Телеграм.lnk").write_bytes(b"L")
+    assert open_("телеграм") == "Открываю 'Телеграм.lnk'." and not asked                # ярлык — без вопроса
+    (desk / "документ.exe").write_bytes(b"MZ")
+    assert open_("документ") == "Не запускаю."                                            # программа — с вопросом
+    assert asked == ["Нашла похожий файл «документ.exe» — это программа. Запустить?"]     # force: даже без confirm
+    asked.clear()
+    (desk / "документ.docx").write_text("x", encoding="utf-8")
+    assert open_("документ") == "Открываю 'документ.docx'." and not asked                # документ — без вопроса
+    assert started == [str(desk / "Телеграм.lnk"), str(desk / "документ.docx")]
 
 
 def test_shortcut_with_same_name_starts_without_question(actions_mod, fake_desktop, monkeypatch):

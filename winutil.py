@@ -19,6 +19,7 @@ import pywinauto
 
 from settings import APP_DICT, DESKTOP_PATH
 import winalias
+from pathsafe import is_program
 
 try:
     import win32com.client as _win32com
@@ -380,7 +381,9 @@ def _find_file(name):
 def _find_file_ex(name):
     """→ (путь, нечёткое) или (None, False). Нечёткое — имя нашлось только похожее («отчет1.docx» → «отчет2.docx»):
     удаление и отправка такого файла спрашивают отдельно, а программы по нему без вопроса не запускаются.
-    Имя без расширения, совпавшее полностью («телеграм» → «Телеграм.lnk»), — точное совпадение."""
+    Имя без расширения, совпавшее полностью («телеграм» → «Телеграм.lnk», «документ» → «документ.pdf»), — точное
+    совпадение, кроме программ и скриптов (.exe .bat .cmd .ps1 .vbs .js .msi .scr): «документ» → «документ.exe»
+    считается похожим, и запуск спрашивает. Документ или ярлык с тем же именем важнее программы."""
     if not name: return None, False
     name = name.strip(" .,!?«»\"'")
     if not name: return None, False
@@ -417,7 +420,7 @@ def _find_file_ex(name):
     for v in list(variants):
         if not v.endswith("ь"): variants.append(v + "ь")
     all_files = {}
-    same_stem = None                  # «телеграм» → «Телеграм.lnk»: отличается только расширение — это не «похожее»
+    same_stem = same_stem_prog = None   # отличается только расширение: ярлык/документ — точно, программа — с вопросом
     for base in search_dirs:
         if not base or not os.path.isdir(base): continue
         try:
@@ -425,11 +428,16 @@ def _find_file_ex(name):
                 full = os.path.join(base, entry)
                 if os.path.isfile(full):
                     all_files[entry.lower()] = full
-                    if same_stem is None and os.path.splitext(entry)[0].lower() == name_low:
-                        same_stem = full
+                    if os.path.splitext(entry)[0].lower() == name_low:
+                        if is_program(entry):
+                            same_stem_prog = same_stem_prog or full
+                        else:
+                            same_stem = same_stem or full
         except OSError: continue
     if same_stem:
         return same_stem, False
+    if same_stem_prog:
+        return same_stem_prog, True
     if all_files:
         all_lower = list(all_files.keys())
         for v in variants:

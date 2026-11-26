@@ -18,10 +18,17 @@ def safe_filename(name):
 
 # Программы и скрипты: найденные по ПОХОЖЕМУ имени, без вопроса не запускаются («открой документ» ≠ «документ.exe»)
 EXECUTABLE_EXTS = {".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".scr", ".lnk"}
+# Сами программы и скрипты (без ярлыков): «документ» → «документ.exe» запускаем только после «Запустить?»,
+# а «телеграм» → «Телеграм.lnk» — сразу
+PROGRAM_EXTS = EXECUTABLE_EXTS - {".lnk"}
 
 
 def is_executable(path):
     return os.path.splitext(str(path or ""))[1].lower() in EXECUTABLE_EXTS
+
+
+def is_program(path):
+    return os.path.splitext(str(path or ""))[1].lower() in PROGRAM_EXTS
 
 
 def _norm(p):
