@@ -278,13 +278,18 @@ def rvc_convert(in_wav, out_wav):
     return _rvc_convert_cli(in_wav, out_wav)
 
 
+RVC_CLI_TIMEOUT = 120
+
+
 def _rvc_convert_cli(in_wav, out_wav):
     """Каждый вызов — свой выходной каталог (раньше общий RVC_OUTPUT_DIR чистился конкурентами)."""
     t0 = time.monotonic()
     out_dir = tempfile.mkdtemp(prefix="rvc_", dir=TEMP_DIR)
     cmd = [RVC_EXE, "convert", in_wav, "--voice", RVC_VOICE_NAME, "--pitch", RVC_PITCH, "-o", out_dir]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace")
+        # timeout: зависший rvc-next.exe держал замок речи и команд — Рокси переставала отвечать совсем
+        subprocess.run(cmd, check=True, capture_output=True, text=True, encoding="utf-8", errors="replace",
+                       timeout=RVC_CLI_TIMEOUT)
         for f in os.listdir(out_dir):
             if f.lower().endswith(".wav"):
                 shutil.move(os.path.join(out_dir, f), out_wav)
@@ -295,6 +300,9 @@ def _rvc_convert_cli(in_wav, out_wav):
     except subprocess.CalledProcessError as e:
         print(f"❌ RVC: {(e.stderr or '')[-300:]}")
         return False
+    except subprocess.TimeoutExpired:
+        print(f"❌ RVC: rvc-next.exe не ответил за {RVC_CLI_TIMEOUT} с — остановила его")
+        return False                         # render_to_file скажет фразу голосом Piper
     except Exception as e:
         print(f"❌ RVC: {e}")
         return False

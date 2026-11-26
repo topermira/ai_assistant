@@ -226,6 +226,38 @@ def test_timers_without_storage_still_work():
     assert tm.describe() and tm.cancel_all() == 1
 
 
+# ---------- RVC: зависший rvc-next.exe ----------
+import importlib.util  # noqa: E402
+import subprocess  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
+
+
+def _real_audio(monkeypatch):
+    """Настоящий audio.py под своим именем (test_bargein подменяет модуль «audio» пустышкой), без звуковых библиотек."""
+    for name in ("sounddevice", "soundfile", "miniaudio", "edge_tts"):
+        monkeypatch.setitem(sys.modules, name, MagicMock(name=name))
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    spec = importlib.util.spec_from_file_location("audio_under_test", os.path.join(root, "audio.py"))
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def test_rvc_cli_timeout_returns_false(monkeypatch, tmp_path):
+    audio_mod = _real_audio(monkeypatch)
+    monkeypatch.setattr(audio_mod, "TEMP_DIR", str(tmp_path))
+    seen = {}
+
+    def hang(cmd, **kw):
+        seen.update(kw)
+        raise subprocess.TimeoutExpired(cmd, kw.get("timeout"))
+
+    monkeypatch.setattr(audio_mod.subprocess, "run", hang)
+    assert audio_mod._rvc_convert_cli("in.wav", str(tmp_path / "out.wav")) is False
+    assert seen["timeout"] == 120
+    assert not list(tmp_path.iterdir())                  # временная папка rvc_* убрана
+
+
 # ---------- губы по звукам ----------
 import numpy as np  # noqa: E402
 import visemes  # noqa: E402
