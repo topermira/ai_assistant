@@ -23,6 +23,55 @@ except ImportError:
 from settings import TG_SESSION_FILE, get_tg_credentials
 
 
+# ==================== УПРАВЛЕНИЕ С ТЕЛЕФОНА: РОВНО ОДИН КАНАЛ ====================
+class PhoneChannel:
+    """Управление с телефона — ровно одним каналом: через свой аккаунт (TgRemote) или, если он не настроен или не может
+    работать, через бота (Bot API). Оба сразу нельзя: одно сообщение боту выполнилось бы дважды.
+
+    Запуск — из одного потока, повторный start() ничего не запускает. Пока аккаунт подключается (нет сети при
+    автозапуске), пробуем снова раз в retry_every секунд, а бота не включаем — иначе, когда сеть появится, работали бы оба.
+    start_remote() -> bool (запущен), remote_pending() -> bool (ещё подключается), start_bot() -> bool (запущен)."""
+
+    def __init__(self, start_remote, remote_pending, start_bot, retry_every=60.0, stop=None, log=print):
+        self._start_remote = start_remote
+        self._remote_pending = remote_pending
+        self._start_bot = start_bot
+        self.retry_every = retry_every
+        self._stop = stop or threading.Event()
+        self.log = log
+        self._lock = threading.Lock()
+        self._thread = None
+        self.channel = None                    # "account" | "bot" | None
+
+    def start(self):
+        with self._lock:
+            if self._thread is not None:
+                return False
+            self._thread = threading.Thread(target=self._run, daemon=True, name="tg-start")
+        self._thread.start()
+        return True
+
+    def join(self, timeout=None):
+        if self._thread is not None:
+            self._thread.join(timeout)
+
+    def _run(self):
+        told = False
+        while not self._stop.is_set():
+            if self._start_remote():
+                self.channel = "account"
+                return
+            if not self._remote_pending():
+                break
+            if not told:
+                told = True
+                self.log(f"📱 Telegram ещё подключается — жду сеть, проверяю раз в {int(self.retry_every)} с")
+            if self._stop.wait(self.retry_every):
+                return
+        if not self._stop.is_set() and self._start_bot():
+            self.channel = "bot"
+
+
 # ==================== СОПОСТАВЛЕНИЕ ИМЁН (чистое, есть тесты) ====================
 def _word_match(t, n):
     """«даниэлю» ~ «даниэль», «васе» ~ «вася», но «маша» !~ «максим»."""
@@ -91,7 +140,10 @@ class TelegramService:
         def runner():
             try:
                 asyncio.set_event_loop(self.loop)
-                self.client = TelegramClient(session_name, api_id, api_hash, loop=self.loop)
+                # connection_retries=-1: без сети (автозапуск раньше Wi-Fi, обрыв, сон ПК) Telethon переподключается
+                # бесконечно, раз в 5 с. Раньше после 5 попыток клиент отключался навсегда — до перезапуска Рокси.
+                self.client = TelegramClient(session_name, api_id, api_hash, loop=self.loop,
+                                             connection_retries=-1, retry_delay=5)
                 self.loop.run_until_complete(self.client.connect())
                 if not self.loop.run_until_complete(self.client.is_user_authorized()):
                     self.error = "сессия не авторизована. Запусти: python telegram_auth.py"
@@ -108,6 +160,10 @@ class TelegramService:
 
         self.thread = threading.Thread(target=runner, daemon=True, name="telegram")
         self.thread.start()
+
+    def pending(self):
+        """Клиент запущен и ещё подключается (нет сети) — не ошибка, а «подожди»."""
+        return self.thread is not None and not self.ready.is_set() and not self.error
 
     def call(self, coro, timeout=60):
         if not self.ready.wait(10):

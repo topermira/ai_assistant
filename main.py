@@ -321,18 +321,34 @@ def _bot_set_owner(uid):
     update_config("tg_bot_owner", config.get("tg_bot_owner"))        # None — ключ уберётся
 
 
+_tg_last_warning = [None]
+
+
+def _remote_chat():
+    return (config.get("tg_remote_chat", "RoxyAIAssistant_bot") or "").strip().lstrip("@")
+
+
+def _remote_account_configured():
+    return bool(_remote_chat() and _TELEGRAM_OK and _tg_session_exists() and get_tg_credentials(config)[0])
+
+
 def _start_remote_account():
     """Чат с ботом (или «Избранное»), который Рокси читает через ТВОЙ аккаунт (Telethon) — Bot API не нужен."""
-    chat = (config.get("tg_remote_chat", "RoxyAIAssistant_bot") or "").strip().lstrip("@")
-    if not chat or not _TELEGRAM_OK or not _tg_session_exists() or not get_tg_credentials(config)[0]:
+    global REMOTE
+    if REMOTE is not None:               # уже работает: второй TgRemote выполнял бы каждую команду ещё раз
+        return True
+    chat = _remote_chat()
+    if not _remote_account_configured():
         return False
+    r = None
     try:
         from telegram_service import TG_SERVICE, _init_telegram_if_needed
         ok, why = _init_telegram_if_needed(config)
         if not ok:
-            print(f"⚠️ Управление с телефона: Telegram не подключился ({why})")
+            if why != _tg_last_warning[0]:          # повтор раз в минуту — одно и то же в журнал не пишем
+                _tg_last_warning[0] = why
+                print(f"⚠️ Управление с телефона: Telegram не подключился ({why})")
             return False
-        global REMOTE
         from tg_remote import TgRemote
         r = TgRemote(TG_SERVICE, chat, _bot_handle,
                      transcribe=stt.transcribe if config.get("tg_voice", True) else None)
@@ -341,23 +357,45 @@ def _start_remote_account():
         return True
     except Exception as e:
         print(f"⚠️ Управление с телефона через аккаунт: {type(e).__name__}: {e}")
+        if r is not None:
+            r.stop()                         # мог успеть подписаться на сообщения — выключаем
         return False
 
 
+def _remote_account_pending():
+    """Свой аккаунт настроен, запущен и ещё подключается (нет сети) — ждём его, а бота не включаем."""
+    try:
+        from telegram_service import TG_SERVICE
+        return _remote_account_configured() and TG_SERVICE.pending() is True
+    except Exception:
+        return False
+
+
+def _start_bot_api():
+    if not settings.TG_BOT_TOKEN:
+        return False
+    try:
+        from telegram_bot import RoxyBot
+        RoxyBot(settings.TG_BOT_TOKEN, _bot_handle, lambda: config.get("tg_bot_owner"), _bot_set_owner).start()
+        return True
+    except Exception as e:
+        print(f"⚠️ Telegram-бот: {e}")
+        return False
+
+
+_PHONE = []
+_PHONE_LOCK = threading.Lock()
+
+
 def _start_bot():
-    def run():
-        # сначала через свой аккаунт (работает и там, где Bot API отвечает 429); не вышло — через Bot API.
-        # Одновременно оба не включаем: иначе одно сообщение боту выполнилось бы дважды.
-        if _start_remote_account():
-            return
-        if not settings.TG_BOT_TOKEN:
-            return
-        try:
-            from telegram_bot import RoxyBot
-            RoxyBot(settings.TG_BOT_TOKEN, _bot_handle, lambda: config.get("tg_bot_owner"), _bot_set_owner).start()
-        except Exception as e:
-            print(f"⚠️ Telegram-бот: {e}")
-    threading.Thread(target=run, daemon=True, name="tg-start").start()
+    """Управление с телефона — одним каналом (telegram_service.PhoneChannel): сначала свой аккаунт (работает и там,
+    где Bot API отвечает 429), не настроен или не работает — бот. Нет сети при запуске — повтор раз в минуту."""
+    with _PHONE_LOCK:
+        if not _PHONE:
+            from telegram_service import PhoneChannel
+            _PHONE.append(PhoneChannel(_start_remote_account, _remote_account_pending, _start_bot_api,
+                                       retry_every=60.0, stop=_shutting_down))
+    _PHONE[0].start()
 
 
 def assistant_loop():

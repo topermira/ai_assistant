@@ -126,6 +126,13 @@ def test_stop_words_from_telegram_keep_roxy_running(main_mod, monkeypatch):
     assert replies == ["Выключить Рокси можно только с компьютера или голосом."] * 4
 
 
+def test_second_remote_is_never_created(main_mod, monkeypatch):
+    created = []
+    monkeypatch.setitem(sys.modules, "tg_remote", MagicMock(TgRemote=lambda *a, **k: created.append(1)))
+    monkeypatch.setattr(main_mod, "REMOTE", object())                   # управление через аккаунт уже работает
+    assert main_mod._start_remote_account() is True and created == []
+
+
 def test_stop_by_voice_still_shuts_down(main_mod, monkeypatch):
     def stop():
         raise _Stopped()

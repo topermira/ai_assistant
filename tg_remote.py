@@ -81,6 +81,16 @@ class TgRemote:
         self.answers = queue.Queue()
         self.waiting = False
         self.transcribe = transcribe     # путь к аудио → текст (stt.transcribe); None — голосовые не поддерживаются
+        self._stopped = False
+
+    def stop(self):
+        """Выключить этот экземпляр (не запустился до конца): он мог успеть подписаться на сообщения, а второй
+        живой экземпляр выполнял бы каждую команду ещё раз."""
+        self._stopped = True
+        try:
+            self.svc.loop.call_soon_threadsafe(self.svc.client.remove_event_handler, self._on_msg)
+        except Exception:
+            pass
 
     # ---------- запуск ----------
     def start(self):
@@ -97,6 +107,8 @@ class TgRemote:
         threading.Thread(target=self._worker, daemon=True, name="tg-remote").start()
 
     async def _on_msg(self, event):
+        if self._stopped:
+            return
         text = (event.raw_text or "").strip()
         if text.startswith(PREFIX.strip()):                    # свои ответы (и подписи к своим снимкам) не читаем
             return

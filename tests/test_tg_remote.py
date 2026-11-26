@@ -90,6 +90,97 @@ def test_forwarded_messages_are_not_commands():
     assert r.jobs.get_nowait() == "громкость 30"
 
 
+def test_stopped_remote_ignores_messages():
+    r = make(lambda *a, **kw: None)
+    r.stop()                                               # у FakeSvc нет loop — снятие обработчика молча пропускается
+    asyncio.run(r._on_msg(ev("громкость 30")))
+    assert r.jobs.empty()
+
+
+# ---------------------------------------------------------------- один канал управления, переподключение
+import telegram_service  # noqa: E402
+
+
+def _quiet(*_):
+    pass
+
+
+def test_phone_channel_uses_bot_when_account_not_configured():
+    bot = []
+    ch = telegram_service.PhoneChannel(lambda: False, lambda: False, lambda: bot.append(1) or True,
+                                       retry_every=0.01, log=_quiet)
+    assert ch.start() and not ch.start()                   # второй запуск ничего не делает
+    ch.join(2)
+    assert bot == [1] and ch.channel == "bot"
+
+
+def test_phone_channel_waits_for_account_and_never_starts_bot():
+    tries, bot = [], []
+
+    def remote():
+        tries.append(1)
+        return len(tries) >= 3                             # сеть появилась к третьей попытке
+
+    ch = telegram_service.PhoneChannel(remote, lambda: True, lambda: bot.append(1) or True,
+                                       retry_every=0.01, log=_quiet)
+    ch.start()
+    ch.join(2)
+    assert len(tries) == 3 and bot == [] and ch.channel == "account"
+
+
+def test_phone_channel_started_from_many_threads_runs_once():
+    calls, gate = [], threading.Event()
+
+    def remote():
+        calls.append(1)
+        gate.wait(2)
+        return True
+
+    ch = telegram_service.PhoneChannel(remote, lambda: False, lambda: True, retry_every=0.01, log=_quiet)
+    starters = [threading.Thread(target=ch.start) for _ in range(5)]
+    for t in starters:
+        t.start()
+    for t in starters:
+        t.join(2)
+    gate.set()
+    ch.join(2)
+    assert calls == [1] and ch.channel == "account"
+
+
+def test_phone_channel_stops_on_exit_without_bot():
+    stop, bot = threading.Event(), []
+    ch = telegram_service.PhoneChannel(lambda: False, lambda: True, lambda: bot.append(1) or True,
+                                       retry_every=10, stop=stop, log=_quiet)
+    ch.start()
+    stop.set()
+    ch.join(2)
+    assert bot == [] and ch.channel is None
+
+
+def test_telegram_client_reconnects_forever(monkeypatch):
+    seen = {}
+
+    class FakeTgClient:
+        def __init__(self, *a, **kw):
+            seen.update(kw)
+
+        async def connect(self):
+            await asyncio.sleep(0.2)
+
+        async def is_user_authorized(self):
+            return True
+
+    monkeypatch.setattr(telegram_service, "TelegramClient", FakeTgClient)
+    svc = telegram_service.TelegramService()
+    assert not svc.pending()
+    svc.start(1, "hash", "session")
+    assert svc.pending()                                   # подключается — не ошибка, а «подожди»
+    assert svc.ready.wait(5) and not svc.error and not svc.pending()
+    assert seen["connection_retries"] == -1 and seen["retry_delay"] == 5
+    svc.loop.call_soon_threadsafe(svc.loop.stop)
+    svc.thread.join(5)
+
+
 def test_send_file_passes_through_to_chat():
     calls = []
 
