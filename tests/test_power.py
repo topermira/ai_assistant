@@ -35,6 +35,32 @@ def test_delay():
     assert power.parse_delay("в 23:30", now) == 5400
 
 
+def test_delay_compound_and_clock():
+    now = datetime.datetime(2026, 1, 1, 20, 0)
+    assert power.parse_delay("выключи компьютер через час десять минут", now) == 4200
+    assert power.parse_delay("выключи компьютер через 2 часа 30 минут", now) == 9000
+    assert power.parse_delay("выключи компьютер через полчаса", now) == 1800
+    assert power.parse_delay("выключи компьютер в 11 вечера", now) == 3 * 3600
+    assert power.parse_delay("выключи компьютер в 23", now) == 3 * 3600
+    assert power.parse_delay("выключи компьютер в 7 утра", now) == 11 * 3600
+    assert power.parse_delay("выключи компьютер", now) == 0
+
+
+@pytest.mark.parametrize("phrase", ["выключи компьютер через немного", "выключи компьютер к 23:00",
+                                    "выключи компьютер завтра", "выключи компьютер вечером"])
+def test_delay_named_but_unclear(phrase):
+    assert power.parse_delay(phrase) == power.UNKNOWN
+
+
+def test_unclear_time_asks_instead_of_shutting_down_now(monkeypatch):
+    calls, asked = [], []
+    monkeypatch.setattr(power.subprocess, "run", lambda *a, **k: calls.append(a[0]))
+    out = power.run("shutdown", power.UNKNOWN, lambda q: asked.append(q) or True)
+    assert not calls and not asked
+    assert out.startswith("Не поняла, когда выключить компьютер.")
+    assert get_intent("выключи компьютер завтра") == ("[ACTION_POWER]", f"shutdown|{power.UNKNOWN}")
+
+
 def test_run_needs_confirmation(monkeypatch):
     calls = []
     monkeypatch.setattr(power.subprocess, "run", lambda *a, **k: calls.append(a[0]) or type("R", (), {"returncode": 0})())

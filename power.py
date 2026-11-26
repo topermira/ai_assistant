@@ -3,6 +3,9 @@ import datetime
 import re
 import subprocess
 
+from scenarios import apply_part, parse_clock
+from timers import parse_duration
+
 # Только сам компьютер. Раньше было компьютер\w*, комп\w*, систем\w+ — и «выключи компьютерную игру»,
 # «выключи композицию», «выключи системные звуки» спрашивали, выключить ли компьютер.
 _DEV = r"(?:компьютер(?:а|у|ом)?\b|комп(?:а|у)?\b|пк\b|ноут(?:бук\w*)?\b|систему\b|windows|винд(?:у|ows)?\b)"
@@ -12,30 +15,28 @@ _RE_OFF = re.compile(r"\b(?:выключи\w*|отключи\w*|заверши\s
                      + r"|\b" + _DEV + r"\s+(?:выключи\w*)")
 _RE_RESTART = re.compile(r"\b(?:перезагрузи\w*|перезапусти\w*|перезагрузка|ребутни)\s+(?:мне\s+)?" + _DEV)
 
-_NUM = {"одну": 1, "одна": 1, "один": 1, "две": 2, "два": 2, "три": 3, "четыре": 4, "пять": 5, "десять": 10,
-        "пятнадцать": 15, "двадцать": 20, "тридцать": 30, "сорок": 40, "сорок пять": 45, "пятьдесят": 50}
+UNKNOWN = -1            # время названо, но не разобрано: переспросить, а не выключать «сейчас»
+_RE_TIME_WORDS = re.compile(r"\d|\b(?:через|утр\w*|вечер\w*|ноч\w*|днём|днем|полдень|полночь|пол\w+ого|"
+                            r"сегодня|завтра|послезавтра)\b")
 
 
 def parse_delay(lower, now=None):
-    """Секунды до выключения: «через 30 минут», «через час», «через полчаса», «в 23:30». Нет — 0."""
-    if re.search(r"через\s+полчаса", lower):
-        return 1800
-    if re.search(r"через\s+полтора\s+часа", lower):
-        return 5400
-    m = re.search(r"через\s+(\d+|[а-я]+(?:\s+[а-я]+)?)?\s*(минут\w*|мин\b|час\w*|секунд\w*|сек\b)", lower)
-    if m:
-        n_raw = (m.group(1) or "").strip()
-        n = int(n_raw) if n_raw.isdigit() else _NUM.get(n_raw, _NUM.get(n_raw.split()[-1], 1) if n_raw else 1)
-        unit = m.group(2)
-        return n * (3600 if unit.startswith("час") else 1 if unit.startswith("сек") else 60)
-    m = re.search(r"\bв\s+(\d{1,2})[:.](\d{2})\b", lower)
-    if m:
-        now = now or datetime.datetime.now()
-        t = now.replace(hour=int(m.group(1)) % 24, minute=int(m.group(2)), second=0, microsecond=0)
+    """Секунды до выключения: «через 30 минут», «через час десять минут», «в 23:30», «в 11 вечера», «в 23».
+    Время не названо — 0 (сейчас). Названо, но не разобрано («к 23:00», «завтра», «вечером») — UNKNOWN.
+    Разбор — общий с таймерами (timers.parse_duration) и расписаниями (scenarios.parse_clock): раньше здесь был
+    свой, и «через час десять минут» давало 10 минут, а «в 11 вечера» — «сейчас»."""
+    now = now or datetime.datetime.now()
+    if re.search(r"\bчерез\b", lower):
+        secs, _ = parse_duration(lower)
+        return int(secs) if secs else UNKNOWN
+    clock = parse_clock(lower)
+    if clock:
+        hh, mm, _start, _end, part, _explicit = clock
+        t = now.replace(hour=apply_part(hh, part) % 24, minute=mm, second=0, microsecond=0)
         if t <= now:
             t += datetime.timedelta(days=1)
         return int((t - now).total_seconds())
-    return 0
+    return UNKNOWN if _RE_TIME_WORDS.search(lower) else 0
 
 
 def parse(lower):
@@ -68,6 +69,10 @@ def run(kind, sec, confirm):
         r = subprocess.run(["shutdown", "/a"], capture_output=True, text=True)
         return "Отменила выключение." if r.returncode == 0 else "Выключение и так не было запланировано."
     word = "Выключить" if kind == "shutdown" else "Перезагрузить"
+    if sec < 0:                         # UNKNOWN: время сказали, но непонятно какое — ничего не выключаем
+        verb = "выключи" if kind == "shutdown" else "перезагрузи"
+        return (f"Не поняла, когда {word.lower()} компьютер. Скажи, например: «{verb} компьютер через 30 минут» "
+                f"или «{verb} компьютер в 23:30».")
     if not confirm(f"{word} компьютер {when(sec)}?"):
         return "Хорошо, не трогаю."
     t = max(MIN_DELAY, int(sec))
