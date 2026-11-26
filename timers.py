@@ -97,6 +97,9 @@ def format_duration(secs):
     return " ".join(parts) or "0 секунд"
 
 
+MAX_WAIT_SEC = 7 * 24 * 3600         # одна часть ожидания длинного таймера (меньше threading.TIMEOUT_MAX)
+
+
 class TimerManager:
     """Таймеры и напоминания. С storage_path переживают перезапуск: «Рокси, пока» больше не теряет напоминания."""
 
@@ -121,12 +124,18 @@ class TimerManager:
         except Exception as e:
             print(f"⚠️ timers: не смогла сохранить: {e}")
 
-    def _schedule(self, seconds, message, due_wall):
-        tid = self._next_id
-        self._next_id += 1
-        t = threading.Timer(max(0.0, seconds), self._fire, args=(tid,))
+    def _schedule(self, seconds, message, due_wall, tid=None, end=None):
+        """Длинные таймеры ждут частями по MAX_WAIT_SEC: если до конца ещё далеко, _fire заводит следующую часть
+        с тем же tid. Раньше «таймер на 2000 часов» падал в потоке с OverflowError (threading.TIMEOUT_MAX на Windows
+        ~49,7 суток), а запись оставалась в списке и в timers.json навсегда."""
+        if tid is None:
+            tid = self._next_id
+            self._next_id += 1
+        if end is None:
+            end = time.monotonic() + seconds
+        t = threading.Timer(min(max(0.0, seconds), MAX_WAIT_SEC), self._fire, args=(tid,))
         t.daemon = True
-        self._timers[tid] = (t, time.monotonic() + seconds, due_wall, message)
+        self._timers[tid] = (t, end, due_wall, message)
         t.start()
         return tid
 
@@ -168,14 +177,20 @@ class TimerManager:
 
     def _fire(self, tid):
         with self._lock:
-            item = self._timers.pop(tid, None)
-            if item:
-                self._save()
-        if item:
-            try:
-                self._on_fire(item[3])
-            except Exception as e:
-                print(f"⚠️ timer: {e}")
+            item = self._timers.get(tid)
+            if item is None:                 # отменили, пока ждали замок
+                return
+            _, end, due_wall, message = item
+            left = end - time.monotonic()
+            if left > 1.0:                   # прошла очередная часть длинного таймера — ждём дальше
+                self._schedule(left, message, due_wall, tid=tid, end=end)
+                return
+            del self._timers[tid]
+            self._save()
+        try:
+            self._on_fire(message)
+        except Exception as e:
+            print(f"⚠️ timer: {e}")
 
     def cancel_all(self):
         """Отмена по просьбе пользователя: таймеры исчезают И из файла."""

@@ -229,6 +229,25 @@ def test_timers_without_storage_still_work():
     assert tm.describe() and tm.cancel_all() == 1
 
 
+def test_long_timer_waits_in_parts(monkeypatch):
+    import timers as timers_mod
+    monkeypatch.setattr(timers_mod, "MAX_WAIT_SEC", 0.05)
+    fired, ev = [], threading.Event()
+    tm = TimerManager(lambda m: (fired.append(m), ev.set()))
+    tm.add(0.3, "длинный")
+    assert next(iter(tm._timers.values()))[0].interval <= 0.05    # Timer заведён на часть, а не на всё время
+    assert ev.wait(3) and fired == ["длинный"] and not tm._timers   # сработал один раз, в конце
+
+
+def test_huge_timer_does_not_overflow():
+    tm = TimerManager(lambda m: None)
+    tm.add(2000 * 3600, "через 2000 часов")                         # больше threading.TIMEOUT_MAX (~49,7 суток)
+    t = next(iter(tm._timers.values()))[0]
+    assert t.interval <= threading.TIMEOUT_MAX and t.is_alive()
+    assert tm.describe()[0][1] == "через 2000 часов"
+    assert tm.cancel_all() == 1
+
+
 # ---------- RVC: зависший rvc-next.exe ----------
 import importlib.util  # noqa: E402
 import subprocess  # noqa: E402
