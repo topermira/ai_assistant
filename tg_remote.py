@@ -12,7 +12,9 @@
 Настройка: config.json → "tg_remote_chat": "RoxyAIAssistant_bot" (имя бота без @) или "me" (Избранное).
 """
 import io
+import os
 import queue
+import tempfile
 import threading
 import time
 
@@ -26,11 +28,47 @@ HELP = ("Пиши мне как голосом. Примеры:\n"
         "• Файлы: «пришли файл отчёт.docx»; файл, присланный сюда, сохраню в «Загрузки»\n"
         "• Компьютер: «как дела у компа», «что запущено», «заверши хром», «заблокируй», «переведи в сон», "
         "«выключи компьютер через час», «громкость 30», «яркость 50»\n"
-        "/screen — снимок экрана, /grid — снимок с сеткой, /help — эта подсказка.")
+        "• Голосовые сообщения: просто наговори команду — распознаю и выполню\n"
+        "• Приблизить клетку: «увеличь Б4» (потом «кликни Б4.5» — клетка делится на 9 частей, как цифры на Num-клавиатуре)\n"
+        "• Камера и микрофон (если разрешены): «сними с веб-камеры», «что ты слышишь»\n"
+        "/screen — снимок экрана, /grid — снимок с сеткой, /menu — кнопки-команды, /help — эта подсказка.")
+
+MENU = ("Быстрые команды — нажми на нужную:\n"
+        "📸 /screen — экран · /grid — экран с сеткой\n"
+        "🖱 /mouse — режим мыши (стрелками)\n"
+        "      /up /down /left /right — двигать курсор на шаг\n"
+        "      /click · /rclick · /dclick — клик, правый, двойной\n"
+        "      /more /less — шаг больше/меньше · /stop — выйти из режима мыши\n"
+        "🔍 /zoom Б4 — приблизить клетку (напиши после /zoom имя клетки)\n"
+        "🎥 /cam — снимок с веб-камеры · 🎙 /mic — что слышно в комнате\n"
+        "❔ /help — все примеры фраз")
+
+# нажимаемые команды (Telegram делает «/команду» в тексте кликабельной) → обычная фраза для Рокси.
+# Стрелки ↑↓←→ понимаются всегда, а не только в режиме мыши.
+SLASH = {
+    "/up": "↑", "/down": "↓", "/left": "←", "/right": "→",
+    "/mouse": "режим мыши", "/stop": "хватит мышь",
+    "/click": "кликни", "/rclick": "кликни правой", "/dclick": "двойной клик",
+    "/more": "шаг больше", "/less": "шаг меньше",
+    "/zoom": "увеличь", "/cam": "сними с веб-камеры", "/mic": "что ты слышишь",
+}
+
+MAX_VOICE_SEC = 90
+
+
+def expand_slash(text):
+    """«/up», «/zoom@Bot Б4» → фраза для Рокси; не наша команда → None."""
+    if not text.startswith("/"):
+        return None
+    head, _, rest = text.partition(" ")
+    cmd = head.split("@")[0].lower()
+    if cmd not in SLASH:
+        return None
+    return (SLASH[cmd] + " " + rest.strip()).strip()
 
 
 class TgRemote:
-    def __init__(self, service, chat, handle_text, log=print):
+    def __init__(self, service, chat, handle_text, log=print, transcribe=None):
         self.svc = service              # telegram_service.TG_SERVICE (уже подключённый)
         self.chat = chat
         self.handle_text = handle_text
@@ -39,6 +77,7 @@ class TgRemote:
         self.jobs = queue.Queue()
         self.answers = queue.Queue()
         self.waiting = False
+        self.transcribe = transcribe     # путь к аудио → текст (stt.transcribe); None — голосовые не поддерживаются
 
     # ---------- запуск ----------
     def start(self):
@@ -60,7 +99,10 @@ class TgRemote:
             return
         msg = getattr(event, "message", None)
         if getattr(msg, "voice", None):
-            self.jobs.put(("__voice__", None))
+            if self.waiting:                                    # голосом можно ответить «да/нет» на вопрос
+                threading.Thread(target=self._voice_answer, args=(msg,), daemon=True, name="tg-voice").start()
+            else:
+                self.jobs.put(("__voice__", msg))
             return
         if getattr(msg, "sticker", None):
             return
@@ -105,6 +147,45 @@ class TgRemote:
         data, cap = screengrid.screenshot(grid=grid)
         self.send_file(data, "screen.jpg", cap, photo=True)
 
+    # ---------- голосовые ----------
+    def _voice_to_text(self, msg):
+        """Голосовое из чата → текст. Бросает RuntimeError с понятным текстом."""
+        if self.transcribe is None:
+            raise RuntimeError("распознавание голосовых не подключено — напиши текстом")
+        f = getattr(msg, "file", None)
+        dur = getattr(f, "duration", None) or 0
+        if dur and dur > MAX_VOICE_SEC:
+            raise RuntimeError(f"голосовое слишком длинное ({int(dur)} с, максимум {MAX_VOICE_SEC})")
+        try:
+            from settings import TEMP_DIR
+            os.makedirs(TEMP_DIR, exist_ok=True)
+            folder = TEMP_DIR
+        except Exception:
+            folder = tempfile.gettempdir()
+        path = os.path.join(folder, f"tg_voice_{int(time.time() * 1000)}.ogg")
+
+        async def _dl():
+            return await self.svc.client.download_media(msg, file=path)
+        got = self.svc.call(_dl(), timeout=90)
+        try:
+            text = (self.transcribe(got or path) or "").strip()
+        finally:
+            try:
+                os.remove(got or path)
+            except OSError:
+                pass
+        return text
+
+    def _voice_answer(self, msg):
+        try:
+            text = self._voice_to_text(msg)
+        except Exception as e:
+            self.log(f"⚠️ Голосовой ответ не разобрала: {e}")
+            return
+        if text:
+            self.log(f"🎙 Ответ голосом: {text}")
+            self.answers.put(text)
+
     def _save_incoming(self, msg):
         """Файл из чата → «Загрузки» (с «(1)», если имя занято)."""
         from pathsafe import safe_filename
@@ -142,15 +223,35 @@ class TgRemote:
                     if kind == "__file__":
                         self._save_incoming(msg)
                     else:
-                        self.send("Голосовые пока не понимаю — напиши текстом.")
+                        self._run_voice(msg)
                 elif text in ("/help", "/start"):
                     self.send(HELP)
+                elif text in ("/menu", "/m"):
+                    self.send(MENU)
                 elif text in ("/screen", "/grid"):
                     self.send_screen(grid=(text == "/grid"))
+                elif text.split("@")[0].strip().lower() == "/zoom":
+                    self.send("Напиши, какую клетку приблизить, например: /zoom Б4 (клетки видно на снимке /grid). "
+                              "Потом можно ещё ближе: /zoom Б4.5")
+                elif expand_slash(text):
+                    self._run(expand_slash(text))
                 else:
                     self._run(text)
             except Exception as e:
                 self.send(f"Ошибка: {type(e).__name__}: {e}")
+
+    def _run_voice(self, msg):
+        try:
+            text = self._voice_to_text(msg)
+        except Exception as e:
+            self.send(f"Голосовое не получилось: {e}")
+            return
+        if not text:
+            self.send("Не разобрала, что сказано в голосовом. Скажи ещё раз или напиши текстом.")
+            return
+        self.log(f"🎙 Голосовое из Telegram: {text}")
+        self.send(f"🎙 Услышала: «{text}»")
+        self._run(text)
 
     def _run(self, text):
         replies = []

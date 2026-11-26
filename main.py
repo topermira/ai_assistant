@@ -312,7 +312,8 @@ def _start_remote_account():
             return False
         global REMOTE
         from tg_remote import TgRemote
-        r = TgRemote(TG_SERVICE, chat, _bot_handle)
+        r = TgRemote(TG_SERVICE, chat, _bot_handle,
+                     transcribe=stt.transcribe if config.get("tg_voice", True) else None)
         r.start()
         REMOTE = r
         return True

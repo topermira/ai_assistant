@@ -488,6 +488,9 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         pyautogui.hotkey('ctrl', 'n')
         return "Новая вкладка."
 
+    if intent == "[ACTION_CAPTURE]":
+        return _media_action(ctx, extracted_task)
+
     if intent == "[ACTION_BRIGHTNESS]":
         import pcctl
         kind, _, n = (extracted_task or "query|0").partition("|")
@@ -503,13 +506,33 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         elif p[0] == "scroll":
             task = ("scroll", int(p[1]))
         elif p[0] == "cell":
-            task = ("cell", int(p[1]), int(p[2]), p[3], int(p[4]))
+            task = ("cell", int(p[1]), int(p[2]), p[3], int(p[4])) + ((p[5],) if len(p) > 5 and p[5] else ())
+        elif p[0] == "zoom":
+            if not ctx.can_send_files():
+                return "Приближение показываю только в Telegram: оно работает через управление с телефона."
+            import screengrid
+            data, cap = screengrid.zoom_screenshot(int(p[1]), int(p[2]), p[3] if len(p) > 3 else "")
+            ctx.send_file(data, "zoom.jpg", cap, photo=True)
+            return f"Приблизила {screengrid.region_name(int(p[1]), int(p[2]), p[3] if len(p) > 3 else '')}."
+        elif p[0] == "step":
+            task = ("step", int(p[1]))
+        elif p[0] == "stepq":
+            task = ("stepq",)
+        elif p[0] == "armode":
+            task = ("armode", p[1])
         elif p[0] in ("down", "up"):
             task = (p[0], p[1] if len(p) > 1 else ("left" if p[0] == "down" else "all"))
         else:
             task = (p[0], p[1] if len(p) > 1 else "center")
         result = pcctl.mouse(task)
-        if p[0] != "ask":                          # на уточняющий вопрос снимок экрана не нужен
+        if p[0] == "step":                         # шаг запоминаем между запусками
+            try:
+                from settings import save_config
+                ctx.config["mouse_step"] = pcctl.get_step()
+                save_config(ctx.config)
+            except Exception as e:
+                print(f"⚠️ Не смогла сохранить шаг мыши: {e}")
+        if p[0] not in ("ask", "step", "stepq", "armode"):    # на вопросы и настройки снимок экрана не нужен
             _screen_after(ctx, delay=0.6 if p[0] in ("click", "cell") else 0.25)
         return result
 
@@ -746,6 +769,82 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         return "Осталось: " + "; ".join(f"{left} — {msg}" for left, msg in items)
 
     return None
+
+
+def _set_allow_media(ctx, on):
+    from settings import save_config
+    ctx.config["allow_media"] = bool(on)
+    try:
+        save_config(ctx.config)
+    except Exception as e:
+        print(f"⚠️ Не смогла сохранить настройку камеры/микрофона: {e}")
+
+
+def _media_action(ctx, task):
+    """Веб-камера и микрофон. По умолчанию выключено; включается отдельной командой с подтверждением."""
+    import mediacap
+    p = (task or "").split("|")
+    if p[0] == "grant":
+        if p[1] == "off":
+            _set_allow_media(ctx, False)
+            return "Закрыла доступ к веб-камере и микрофону."
+        if mediacap.allowed(ctx.config):
+            return "Доступ к камере и микрофону уже разрешён. Закрыть: «запрети камеру и микрофон»."
+        if not ctx.confirm("Разрешить мне снимать с веб-камеры и слушать микрофон по твоей команде? "
+                           "Отключить можно в любой момент: «запрети камеру и микрофон».", force=True):
+            return "Оставляю доступ к камере и микрофону выключенным."
+        _set_allow_media(ctx, True)
+        return "Разрешила. Теперь работают «сними с веб-камеры» и «что ты слышишь»."
+    if not mediacap.allowed(ctx.config):
+        return ("Доступ к веб-камере и микрофону выключен (так безопаснее). "
+                "Чтобы включить, скажи «разреши камеру и микрофон».")
+    if p[0] == "cam":
+        print("🎥 Снимаю с веб-камеры по команде.")
+        try:
+            data = mediacap.capture_photo()
+        except RuntimeError as e:
+            return f"Не вышло снять: {e}."
+        if ctx.can_send_files():
+            ctx.send_file(data, "webcam.jpg", "Снимок с веб-камеры", photo=True)
+            return "Скинула снимок с веб-камеры."
+        from settings import TEMP_DIR
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        path = os.path.join(TEMP_DIR, time.strftime("webcam_%Y-%m-%d_%H-%M-%S.jpg"))
+        with open(path, "wb") as f:
+            f.write(data)
+        return f"Сняла и сохранила: {path}"
+    if p[0] == "mic":
+        sec = int(p[1]) if len(p) > 1 else mediacap.MIC_DEFAULT_SEC
+        send_audio = len(p) > 2 and p[2] == "1"
+        import stt
+        from settings import TEMP_DIR
+        os.makedirs(TEMP_DIR, exist_ok=True)
+        path = os.path.join(TEMP_DIR, f"mic_{int(time.time() * 1000)}.wav")
+        print(f"🎙 Слушаю микрофон {sec} с по команде.")
+        stt.PAUSE_WAKE.set()                       # пока пишем комнату, на «Рокси» не реагируем
+        try:
+            level = mediacap.record_mic(sec, path)
+        except RuntimeError as e:
+            return f"Не вышло послушать: {e}."
+        finally:
+            stt.PAUSE_WAKE.clear()
+        audio_bytes = None
+        if send_audio and ctx.can_send_files():
+            with open(path, "rb") as f:
+                audio_bytes = f.read()
+        if level < mediacap.SILENCE_RMS:
+            try:
+                os.remove(path)
+            except OSError:
+                pass
+            if audio_bytes:
+                ctx.send_file(audio_bytes, "mic.wav", f"Запись {sec} с (тихо)", photo=False)
+            return f"За {sec} с было тихо — ничего не слышу."
+        text = stt.transcribe(path, use_prompt=False)     # удаляет файл сам
+        if audio_bytes:
+            ctx.send_file(audio_bytes, "mic.wav", f"Запись {sec} с", photo=False)
+        return f"Слышу: «{text}»" if text else f"За {sec} с звук был, но слов я не разобрала."
+    return "Не поняла, что сделать с камерой или микрофоном."
 
 
 def _screen_after(ctx, delay=0.4):

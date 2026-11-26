@@ -6,6 +6,7 @@ LLM-части (анализ кода, роутер) передаются сна
 import re
 
 import keys as keyboard_keys
+import mediacap
 import pcctl
 import phonefiles
 import power
@@ -305,7 +306,7 @@ def type_target(lower):
 
 
 ACTION_INTENTS = {
-    "[ACTION_POWER]", "[ACTION_BRIGHTNESS]", "[ACTION_MOUSE]", "[ACTION_KEYS]", "[ACTION_SYS]", "[ACTION_PHONE]",
+    "[ACTION_POWER]", "[ACTION_BRIGHTNESS]", "[ACTION_CAPTURE]", "[ACTION_MOUSE]", "[ACTION_KEYS]", "[ACTION_SYS]", "[ACTION_PHONE]",
     "[ACTION_OPEN]", "[ACTION_TYPE]", "[ACTION_CREATE]", "[ACTION_NEW_TAB]", "[ACTION_CODE_FILE]",
     "[ACTION_WINDOW]", "[ACTION_RENAME]", "[ACTION_MAXIMIZE_CURSOR]", "[ACTION_MAXIMIZE_FULL]",
     "[ACTION_SHOW_GUI]", "[ACTION_HIDE_GUI]", "[ACTION_CLEAR_TEXT]", "[ACTION_CLEAR_CONTEXT]",
@@ -412,6 +413,8 @@ def get_intent(user_text, library_lookup=None, code_analyzer=None, llm_router=No
     if sc: return "[ACTION_SYS]", "|".join(sc)
     pf = phonefiles.parse(text)                  # файлы/скриншоты/буфер ↔ телефон
     if pf: return "[ACTION_PHONE]", "|".join(pf)
+    md = mediacap.parse(lower)                   # камера и микрофон: «сними с веб-камеры», «что ты слышишь», «разреши камеру»
+    if md: return "[ACTION_CAPTURE]", "|".join(str(x) for x in md)
     ms = pcctl.parse_mouse(lower)                # до vision-агента: «кликни» без цели — просто клик
     if ms: return "[ACTION_MOUSE]", "|".join(str(x) for x in ms)
     ks = keyboard_keys.parse_keys(lower)                  # «нажми Enter», «Ctrl+C» — после мыши («нажми правой» — клик)

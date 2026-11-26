@@ -10,6 +10,7 @@
 """
 import re
 import subprocess
+import time
 
 # ---------------------------------------------------------------- мышь
 _MOUSE = r"(?:мыш\w*|курсор\w*|указател\w*)"
@@ -52,6 +53,102 @@ def _parse_click(lower):
     if not hit:
         return None                                   # «нажми» без кнопки/мыши/клика — не наше
     return "click", btn or "left", n
+
+
+# ---------------------------------------------------------------- режим мыши «стрелками»
+# «режим мыши» → дальше голые «вниз», «вправо», «ещё», «чуть выше», «шаг 50», «больше/меньше», «клик».
+# Стрелки ↑↓←→ и «шаг 50» работают и без режима. Режим сам выключается через 5 минут тишины.
+ARROW_MODE_SEC = 300
+STEP_MIN, STEP_MAX = 1, 1000
+_STEP = [None]                       # текущий шаг в пикселях (None — ещё не читали из config.json)
+_ARROW = {"until": 0.0, "last": None}   # last — единичное направление последнего сдвига для «ещё»
+
+_ARROW_CHARS = {"↑": (0, -1), "↓": (0, 1), "←": (-1, 0), "→": (1, 0), "⬆": (0, -1), "⬇": (0, 1), "⬅": (-1, 0), "➡": (1, 0)}
+_RE_ARROWS = re.compile(r"^\s*(?:рокси\W+)?([↑↓←→⬆⬇⬅➡️\uFE0F]+)\s*(?:(\d+)\s*(?:пикс\w*|px|точ\w*)?)?\s*$")
+_RE_MODE_ON = re.compile(r"^\s*(?:рокси\W+)?(?:(?:включи|давай|запусти|перейди\s+в|врубай)\s+)?(?:режим\s+(?:мыши|мышки|мышь|курсора|стрелок)|"
+                         r"управление\s+(?:мышью|мышкой|курсором)|мышь\s+стрелками|мышку\s+стрелками|стрелки\s+мыши)\s*$")
+_RE_MODE_OFF = re.compile(r"^\s*(?:рокси\W+)?(?:(?:хватит|стоп|выход|закончили|всё|все|достаточно)\s+(?:с\s+)?(?:мыш\w*|курсор\w*|режим\w*(?:\s+мыши)?)|"
+                          r"(?:выключи|выйди\s+из|отключи|закрой)\s+режим\w*\s*(?:мыши|мышки|мышь|курсора|стрелок)?)\s*$")
+_RE_STEP_SET = re.compile(r"^\s*(?:рокси\W+)?(?:(?:поставь|установи|сделай|задай|измени)\s+)?шаг(?:\s+(?:мыши|мышки|мышью|курсора))?\s*(?:на|в|=)?\s*(\d+)\s*(?:пикс\w*|px|точ\w*)?\s*$")
+_RE_STEP_Q = re.compile(r"^\s*(?:рокси\W+)?(?:какой\s+)?шаг(?:\s+(?:мыши|мышки|курсора))?\s*\??\s*$")
+_RE_STEP_BIG = re.compile(r"^\s*(?:рокси\W+)?(?:(?:сделай|поставь)\s+)?(?:шаг(?:\s+(?:мыши|мышки|курсора))?\s+)?(больше|побольше|крупнее|крупнее|шире|меньше|поменьше|мельче|мельче|точнее)\s*$")
+_BIGGER = {"больше", "побольше", "крупнее", "шире"}
+_RE_MORE = re.compile(r"^\s*(?:рокси\W+)?(?:ещё|еще|ещё\s+раз|еще\s+раз|повтори|дальше|тоже)\s*$")
+_BARE_ARROW_OK = re.compile(r"^(?:на|и|ещё|еще|чуть|немного|пикс\w*|px|точ\w*|\d+)$")
+
+
+def get_step():
+    if _STEP[0] is None:
+        try:
+            from settings import live_config
+            _STEP[0] = min(STEP_MAX, max(STEP_MIN, int(live_config("mouse_step", DEFAULT_STEP))))
+        except Exception:
+            _STEP[0] = DEFAULT_STEP
+    return _STEP[0]
+
+
+def set_step(n):
+    _STEP[0] = min(STEP_MAX, max(STEP_MIN, int(n)))
+    return _STEP[0]
+
+
+def arrow_mode_active():
+    return time.monotonic() < _ARROW["until"]
+
+
+def _arrow_mode(on):
+    _ARROW["until"] = time.monotonic() + ARROW_MODE_SEC if on else 0.0
+
+
+def _touch_arrow_mode():
+    if arrow_mode_active():
+        _ARROW["until"] = time.monotonic() + ARROW_MODE_SEC
+
+
+def _parse_arrow(lower):
+    """Стрелки/шаг/режим. → ('move', dx, dy) | ('step', n) | ('stepq',) | ('armode', 'on'|'off') | None.
+    Голые «вниз/вправо/ещё/больше/меньше» понимаем только пока режим мыши включён."""
+    m = _RE_ARROWS.match(lower)
+    if m:
+        chars = [c for c in m.group(1) if c in _ARROW_CHARS]
+        if not chars:
+            return None
+        n = int(m.group(2)) if m.group(2) else get_step()
+        dx = sum(_ARROW_CHARS[c][0] for c in chars) * n
+        dy = sum(_ARROW_CHARS[c][1] for c in chars) * n
+        return "move", dx, dy
+    if _RE_MODE_ON.match(lower):
+        return "armode", "on"
+    if arrow_mode_active() and _RE_MODE_OFF.match(lower):
+        return "armode", "off"
+    if _RE_MODE_OFF.match(lower) and re.search(r"мыш|курсор|режим", lower):
+        return "armode", "off"
+    m = _RE_STEP_SET.match(words_to_digits(lower))
+    if m:
+        return "step", min(STEP_MAX, max(STEP_MIN, int(m.group(1))))
+    if _RE_STEP_Q.match(lower) and (arrow_mode_active() or "шаг" in lower):
+        return ("stepq",)
+    m = _RE_STEP_BIG.match(lower) if (arrow_mode_active() or "шаг" in lower) else None
+    if not m and not arrow_mode_active():
+        return None
+    if m:
+        cur = get_step()
+        return "step", min(STEP_MAX, max(STEP_MIN, cur * 2 if m.group(1) in _BIGGER else max(1, cur // 2)))
+    if _RE_MORE.match(lower) and _ARROW["last"]:
+        ux, uy = _ARROW["last"]
+        s = get_step()
+        return "move", ux * s, uy * s
+    words = re.findall(r"[a-zа-яё0-9]+", words_to_digits(lower))
+    dirs = [w for w in words if w in _DIRS]
+    rest = [w for w in words if w not in _DIRS and not w.startswith("рокси")]
+    if dirs and all(_BARE_ARROW_OK.match(w) for w in rest):
+        nums = [int(w) for w in rest if w.isdigit()]
+        small = any(w in ("чуть", "немного") for w in rest)
+        n = nums[0] if nums else (max(5, get_step() // 4) if small else get_step())
+        dx = sum(_DIRS[d][0] for d in dirs) * n
+        dy = sum(_DIRS[d][1] for d in dirs) * n
+        return "move", dx, dy
+    return None
 
 
 _RE_SCROLL = re.compile(r"\b(?:прокрути|пролистай|промотай|листни|скролл\w*)\s*(?:страницу\s*|мышкой\s*)?(вниз|вверх)(?:\s+на\s+(\d+))?")
@@ -156,21 +253,41 @@ _CELL_GOTO_OK = re.compile(r"^(?:курсор\w*|мыш\w*|мышк\w*|указ�
                            r"подвинь|сдвинь|двинь|веди|в|во|на|по|к|клетк\w*|ячейк\w*|рокси|туда|иди)$")
 
 
-def _parse_cell(text):
-    """«Б4», «курсор в Б4» → ('cell', col, row, '', 0); «кликни Б4», «нажми правой в Б4» → с кликом."""
+_ZOOM_VERB = re.compile(r"^(?:увеличь|увеличить|приблизь|приблизить|приближ\w*|зум|zoom|покажи|крупнее|крупно|рассмотри|"
+                        r"подробнее|подробно|рокси|клетк\w*|ячейк\w*|квадрат\w*|в|во|на|по|к|мне|ка)$")
+
+
+def _parse_zoom(text):
+    """«увеличь Б4», «приблизь Б4.5», «zoom б4», «покажи крупно Б4» → ('zoom', col, row, subs)."""
     import screengrid
-    fc = screengrid.find_cell(text)
+    fc = screengrid.find_cell_path(text)
     if not fc:
         return None
-    col, row, a, b = fc
+    col, row, subs, a, b = fc
+    words = re.findall(r"[a-zа-яё0-9]+", (text[:a] + " " + text[b:]).strip())
+    if words and any(re.match(r"^(?:увеличь|увеличить|приблизь|приблизить|приближ\w*|зум|zoom|крупно|крупнее|рассмотри|подробнее|подробно)$", w)
+                     for w in words) and all(_ZOOM_VERB.match(w) for w in words):
+        return "zoom", col, row, subs
+    return None
+
+
+def _parse_cell(text):
+    """«Б4», «курсор в Б4» → ('cell', col, row, '', 0); «кликни Б4», «нажми правой в Б4» → с кликом.
+    С подклеткой («Б4.5», «кликни Б4.7.3») кортеж длиннее на одно поле: ('cell', col, row, btn, n, '5')."""
+    import screengrid
+    fc = screengrid.find_cell_path(text)
+    if not fc:
+        return None
+    col, row, subs, a, b = fc
+    extra = (subs,) if subs else ()
     rest = (text[:a] + " " + text[b:]).strip()
     words = re.findall(r"[a-zа-яё0-9]+", rest)
     if all(_CELL_GOTO_OK.match(w) for w in words):
-        return "cell", col, row, "", 0
+        return ("cell", col, row, "", 0) + extra
     words = [w for w in words if w not in ("в", "во", "по", "к", "клетке", "клетку", "ячейке", "ячейку")]
     c = _parse_click(" ".join(words))
     if c:
-        return "cell", col, row, c[1], c[2]
+        return ("cell", col, row, c[1], c[2]) + extra
     return None
 
 
@@ -181,12 +298,18 @@ def parse_mouse(lower):
     if m:
         n = int(m.group(2) or 5)
         return "scroll", (-n if m.group(1) == "вниз" else n)
+    a = _parse_arrow(lower)
+    if a:
+        return a
     h = _parse_hold(lower)
     if h:
         return h
     c = _parse_click(lower)
     if c:
         return c
+    z = _parse_zoom(words_to_digits(lower))
+    if z:
+        return z
     c = _parse_cell(words_to_digits(lower))
     if c:
         return c
@@ -205,7 +328,7 @@ def parse_mouse(lower):
     dx = dy = 0
     found = False
     for n1, d, n2 in _RE_STEP.findall(lower):
-        n = int(n1 or n2 or DEFAULT_STEP)
+        n = int(n1 or n2 or get_step())
         ux, uy = _DIRS[d]
         dx += ux * n
         dy += uy * n
@@ -258,7 +381,22 @@ def mouse(task):
             w, h = pyautogui.size()
             nx, ny = min(max(0, x + dx), w - 1), min(max(0, y + dy), h - 1)
             pyautogui.moveTo(nx, ny, duration=0.15)
+            if dx or dy:
+                _ARROW["last"] = ((dx > 0) - (dx < 0), (dy > 0) - (dy < 0))
+            _touch_arrow_mode()
             return f"Подвинула курсор: теперь {nx}, {ny}."
+        if kind == "step":
+            return f"Шаг курсора теперь {set_step(task[1])} px."
+        if kind == "stepq":
+            return f"Шаг курсора сейчас {get_step()} px. Поменять: «шаг 50», в режиме мыши «больше»/«меньше»."
+        if kind == "armode":
+            if task[1] == "off":
+                _arrow_mode(False)
+                return "Режим мыши выключен."
+            _arrow_mode(True)
+            return (f"Режим мыши включён, шаг {get_step()} px (выключится сам через {ARROW_MODE_SEC // 60} мин тишины).\n"
+                    "Пиши «вниз», «вправо», «чуть выше», «вниз 30», «ещё», «клик», «шаг 50», «больше»/«меньше», выход — «хватит мышь».\n"
+                    "Кнопками: /up /down /left /right /click /more /less /stop")
         if kind == "goto":
             w, h = pyautogui.size()
             pos = {"center": (w // 2, h // 2), "tl": (5, 5), "tr": (w - 6, 5), "bl": (5, h - 6), "br": (w - 6, h - 6)}[task[1]]
@@ -274,11 +412,12 @@ def mouse(task):
             return "Прокрутила вниз." if task[1] < 0 else "Прокрутила вверх."
         if kind == "cell":
             import screengrid
-            _, col, row, btn, n = task
+            _, col, row, btn, n, *more = task
+            subs = more[0] if more else ""
             w, h = pyautogui.size()
-            x, y = screengrid.cell_center(col, row, w, h)
+            x, y = screengrid.region_center(col, row, subs, w, h)
             pyautogui.moveTo(x, y, duration=0.15)
-            name = screengrid.cell_name(col, row)
+            name = screengrid.region_name(col, row, subs)
             if not btn:
                 return f"Курсор в {name}."
             pyautogui.click(button=btn, clicks=n, interval=0.08)
