@@ -89,6 +89,11 @@ def test_router_called_only_as_fallback():
     ("да", True), ("Да, удаляй.", True), ("давай", True), ("ага", True),
     ("нет", False), ("да нет, не надо", False), ("отмена", False),
     ("эээ", None), ("", None),
+    # отказ со словом из «да»-списка («удаляй», «давай», «можно») — это «нет», а не согласие
+    ("не удаляй", False), ("не отправляй", False), ("не делай этого", False), ("не, давай", False),
+    ("давай не будем", False), ("давай не сейчас", False), ("не знаю, давай потом", False),
+    ("можно потом", False), ("ага, щас", False), ("неа", False), ("подожди", False), ("стой", False),
+    ("да, отправляй", True),
 ])
 def test_yes_no(ans, expected):
     assert parse_yes_no(ans) is expected
