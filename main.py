@@ -197,6 +197,10 @@ def handle(text):
     latency.note(intent)
 
     if intent == "[ACTION_STOP]":
+        if _bot_reply():                 # из Telegram: включить Рокси обратно с телефона нельзя
+            print("📱 «Стоп» из Telegram — не выключаюсь.")
+            _bot_reply()("Выключить Рокси можно только с компьютера или голосом.")
+            return
         print("👋 СТОП.")
         LIVE2D.emotion("sad", 3000)
         if getattr(_sink, "flush", None):

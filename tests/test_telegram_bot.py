@@ -60,3 +60,55 @@ def test_confirm_in_chat():
     b._on_update(upd("да"))
     t.join(3)
     assert b.sent[-1] == (5, "ок")
+
+
+# ---------------------------------------------------------------- «пока» из Telegram Рокси не выключает
+import importlib  # noqa: E402
+import os  # noqa: E402
+import sys  # noqa: E402
+from unittest.mock import MagicMock  # noqa: E402
+
+import pytest  # noqa: E402
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+@pytest.fixture()
+def main_mod(monkeypatch):
+    """main.py без звука, окон и сети: тяжёлые модули — заглушки (gui.install_redirect тоже)."""
+    before = set(sys.modules)
+    for name in ("gui", "keyboard", "audio", "stt", "bargein", "llm", "actions", "telegram_service", "winutil",
+                 "live2d_client", "library"):
+        monkeypatch.setitem(sys.modules, name, MagicMock(name=name))
+    sys.modules.pop("main", None)
+    mod = importlib.import_module("main")
+    yield mod
+    for name in set(sys.modules) - before:          # модули проекта, импортированные поверх заглушек, — убрать
+        f = getattr(sys.modules.get(name), "__file__", None)
+        if isinstance(f, str) and os.path.abspath(f).startswith(ROOT + os.sep) and os.sep + ".venv" + os.sep not in f:
+            sys.modules.pop(name, None)
+
+
+class _Stopped(Exception):
+    pass
+
+
+def test_stop_words_from_telegram_keep_roxy_running(main_mod, monkeypatch):
+    calls, replies = [], []
+    monkeypatch.setattr(main_mod, "shutdown", lambda: calls.append("shutdown"))
+    main_mod._sink.reply, main_mod._sink.flush = replies.append, lambda: None
+    try:
+        for text in ("пока", "спать", "выход", "Рокси, стоп"):
+            main_mod.handle(text)
+    finally:
+        main_mod._sink.reply = main_mod._sink.flush = None
+    assert calls == []
+    assert replies == ["Выключить Рокси можно только с компьютера или голосом."] * 4
+
+
+def test_stop_by_voice_still_shuts_down(main_mod, monkeypatch):
+    def stop():
+        raise _Stopped()
+    monkeypatch.setattr(main_mod, "shutdown", stop)
+    with pytest.raises(_Stopped):
+        main_mod.handle("пока")
