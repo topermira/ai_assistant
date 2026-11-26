@@ -35,3 +35,26 @@ def test_launcher_save_overrides(tmp_path, monkeypatch):
     p = _use(tmp_path, monkeypatch, {"voice_volume": 0.3})
     settings.save_config({"voice_volume": 1.2}, from_launcher=True)
     assert json.loads(p.read_text(encoding="utf-8"))["voice_volume"] == 1.2
+
+
+def test_update_config_keeps_launcher_changes(tmp_path, monkeypatch):
+    # лаунчер включил «Спрашивать перед опасным», пока Рокси работает; её копия в памяти — старая
+    p = _use(tmp_path, monkeypatch, {"confirm_dangerous": True, "voice_mode": "anime", "tg_bot_owner": 7})
+    monkeypatch.setattr(settings, "config", {"confirm_dangerous": False, "voice_mode": "anime", "tg_bot_owner": 7})
+    settings.update_config("voice_mode", "fast")
+    assert json.loads(p.read_text(encoding="utf-8")) == {"confirm_dangerous": True, "voice_mode": "fast",
+                                                         "tg_bot_owner": 7}
+    settings.update_config("tg_bot_owner", None)                 # None — ключ убирается
+    assert json.loads(p.read_text(encoding="utf-8")) == {"confirm_dangerous": True, "voice_mode": "fast"}
+
+
+def test_update_config_without_file_or_with_broken_file(tmp_path, monkeypatch):
+    p = tmp_path / "config.json"
+    monkeypatch.setattr(settings, "CONFIG_FILE", str(p))
+    monkeypatch.setattr(settings, "config", {"voice_mode": "anime"})
+    settings.update_config("pet_autonomy", False)               # файла нет — основа из памяти
+    assert json.loads(p.read_text(encoding="utf-8")) == {"voice_mode": "anime", "pet_autonomy": False}
+    p.write_text("{битый", encoding="utf-8")
+    settings.update_config("pet_autonomy", True)
+    assert json.loads(p.read_text(encoding="utf-8")) == {"voice_mode": "anime", "pet_autonomy": True}
+    assert (tmp_path / "config.json.broken").read_text(encoding="utf-8") == "{битый"

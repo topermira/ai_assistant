@@ -209,10 +209,44 @@ def save_config(cfg, from_launcher=False):
     if TG_API_ID and TG_API_HASH:
         for k in _SECRET_CONFIG_KEYS:
             data.pop(k, None)
+    _write_config(data)
+
+
+def _write_config(data):
     tmp = CONFIG_FILE + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
         json.dump(data, f, ensure_ascii=False, indent=4)
     os.replace(tmp, CONFIG_FILE)
+
+
+def update_config(key, value):
+    """Поменять в config.json ОДИН ключ (value=None — убрать его): свежая копия с диска + этот ключ, атомарная запись.
+    Так Рокси сохраняет свои настройки. Раньше она писала save_config(config) — всю свою копию с момента запуска —
+    и откатывала то, что лаунчер успел поменять (например, «Спрашивать перед опасным»)."""
+    data = None
+    if os.path.exists(CONFIG_FILE):
+        try:
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            if not isinstance(data, dict):
+                raise ValueError("в файле не словарь настроек")
+        except ValueError as e:                      # битый JSON (ошибки чтения файла — наверх, ничего не пишем)
+            data = None
+            print(f"⚠️ config.json повреждён ({e}); сохраняю его как config.json.broken и пишу копию из памяти")
+            try:
+                os.replace(CONFIG_FILE, CONFIG_FILE + ".broken")
+            except OSError:
+                pass
+    if data is None:
+        data = dict(config)                          # файла нет или он битый — берём то, что в памяти
+    if value is None:
+        data.pop(key, None)
+    else:
+        data[key] = value
+    if TG_API_ID and TG_API_HASH:
+        for k in _SECRET_CONFIG_KEYS:
+            data.pop(k, None)
+    _write_config(data)
 
 
 def get_tg_credentials(cfg=None):

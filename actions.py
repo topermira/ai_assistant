@@ -180,8 +180,8 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         if extracted_task in ("autonomy_on", "autonomy_off"):
             ctx.config["pet_autonomy"] = extracted_task == "autonomy_on"
             try:
-                from settings import save_config
-                save_config(ctx.config)
+                from settings import update_config
+                update_config("pet_autonomy", ctx.config["pet_autonomy"])
             except Exception:
                 pass
         if extracted_task == "perch":
@@ -537,9 +537,9 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         result = pcctl.mouse(task)
         if p[0] == "step":                         # шаг запоминаем между запусками
             try:
-                from settings import save_config
+                from settings import update_config
                 ctx.config["mouse_step"] = pcctl.get_step()
-                save_config(ctx.config)
+                update_config("mouse_step", ctx.config["mouse_step"])
             except Exception as e:
                 print(f"⚠️ Не смогла сохранить шаг мыши: {e}")
         if p[0] not in ("ask", "step", "stepq", "armode"):    # на вопросы и настройки снимок экрана не нужен
@@ -914,10 +914,10 @@ def _is_stop_phrase(text):
 
 
 def _set_allow_media(ctx, on):
-    from settings import save_config
+    from settings import update_config
     ctx.config["allow_media"] = bool(on)
     try:
-        save_config(ctx.config)
+        update_config("allow_media", ctx.config["allow_media"])
     except Exception as e:
         print(f"⚠️ Не смогла сохранить настройку камеры/микрофона: {e}")
 

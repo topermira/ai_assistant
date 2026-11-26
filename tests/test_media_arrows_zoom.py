@@ -147,16 +147,16 @@ def test_media_is_off_by_default(actions_mod, monkeypatch):
 
 def test_media_grant_needs_confirmation_and_persists(actions_mod, monkeypatch):
     saved = []
-    monkeypatch.setitem(sys.modules, "settings", MagicMock(save_config=lambda c: saved.append(dict(c)),
+    monkeypatch.setitem(sys.modules, "settings", MagicMock(update_config=lambda k, v: saved.append((k, v)),
                                                           live_config=lambda *a, **k: None))
     ctx, asked = _ctx(actions_mod, False, cfg={})
     assert "выключенным" in actions_mod.execute_pc_action("[ACTION_CAPTURE]", "", "grant|on", ctx)
     assert asked and not ctx.config.get("allow_media")
     ctx, asked = _ctx(actions_mod, True, cfg={})
     assert "Разрешила" in actions_mod.execute_pc_action("[ACTION_CAPTURE]", "", "grant|on", ctx)
-    assert ctx.config["allow_media"] is True and saved
+    assert ctx.config["allow_media"] is True and saved == [("allow_media", True)]
     assert "Закрыла" in actions_mod.execute_pc_action("[ACTION_CAPTURE]", "", "grant|off", ctx)
-    assert ctx.config["allow_media"] is False
+    assert ctx.config["allow_media"] is False and saved[-1] == ("allow_media", False)
 
 
 def test_media_camera_sends_photo(actions_mod, monkeypatch):

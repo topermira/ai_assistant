@@ -11,7 +11,7 @@ import threading
 import subprocess
 
 import settings
-from settings import (config, save_config, get_tg_credentials, MOANS_DIR, LIVE2D_SCRIPT, LIVE2D_PORT,
+from settings import (config, update_config, get_tg_credentials, MOANS_DIR, LIVE2D_SCRIPT, LIVE2D_PORT,
                       TEMP_DIR, MISSING_SECRETS)
 import gui
 gui.install_redirect()     # до остальных импортов, чтобы их предупреждения попали в лог
@@ -218,7 +218,7 @@ def handle(text):
         if intent in ("[MODE_FAST]", "[MODE_ANIME]"):
             VOICE_MODE = "fast" if intent == "[MODE_FAST]" else "anime"
             config["voice_mode"] = VOICE_MODE
-            save_config(config)
+            update_config("voice_mode", VOICE_MODE)
             if VOICE_MODE == "anime" and config.get("rvc_worker", True):
                 from rvc_client import WORKER
                 WORKER.start()
@@ -314,7 +314,7 @@ def _bot_set_owner(uid):
         config.pop("tg_bot_owner", None)
     else:
         config["tg_bot_owner"] = int(uid)
-    save_config(config)
+    update_config("tg_bot_owner", config.get("tg_bot_owner"))        # None — ключ уберётся
 
 
 def _start_remote_account():
