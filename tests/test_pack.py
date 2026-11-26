@@ -1,4 +1,3 @@
-import os
 import zipfile
 
 import install_helper
@@ -24,5 +23,6 @@ def test_pack_skips_secrets_and_venv(tmp_path):
     out = tmp_path / "o.zip"
     with zipfile.ZipFile(out, "w") as z:
         pack_roxy.add_tree(z, str(src), "Roxy", [0, 0])
-    names = set(zipfile.ZipFile(out).namelist())
-    assert names == {os.path.join("Roxy", "main.py"), os.path.join("Roxy", "models", "m.vrm")}
+    # zipfile хранит пути через «/» на любой ОС, а os.path.join на Windows дал бы «\» — сравниваем без разделителя ОС
+    names = {n.replace("\\", "/") for n in zipfile.ZipFile(out).namelist()}
+    assert names == {"Roxy/main.py", "Roxy/models/m.vrm"}
