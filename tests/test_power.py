@@ -1,7 +1,21 @@
 import datetime
 
+import pytest
+
 import power
 from intents import get_intent
+
+
+@pytest.mark.parametrize("phrase", ["выключи системные звуки", "выключи композицию", "выключи компьютерную игру"])
+def test_not_pc_shutdown(phrase):
+    assert power.parse(phrase) is None
+    assert get_intent(phrase)[0] != "[ACTION_POWER]"
+
+
+@pytest.mark.parametrize("phrase", ["выключи компьютер", "выключи комп", "выключи ноутбук"])
+def test_pc_shutdown(phrase):
+    assert power.parse(phrase) == ("shutdown", 0)
+    assert get_intent(phrase) == ("[ACTION_POWER]", "shutdown|0")
 
 
 def test_intents():
