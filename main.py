@@ -27,7 +27,7 @@ from live2d_client import LIVE2D
 from text_tts import extract_emotion
 from timers import TimerManager
 from library import find_work_in_library
-from actions import execute_pc_action, ActionContext
+from actions import execute_pc_action, execute_routed, ActionContext
 from telegram_service import _TELEGRAM_OK, _tg_session_exists
 from winutil import _force_foreground
 
@@ -190,7 +190,9 @@ def _get_intent(text):
 
 def handle(text):
     global VOICE_MODE, _current_intent
-    intent, task = _get_intent(text)
+    res = _get_intent(text)
+    intent, task = res
+    routed_phrase = getattr(res, "phrase", None)          # команду понял LLM-роутер (llm.Routed)
     _current_intent = intent
     print(f"🧭 Intent: {intent}")
     latency.mark("intent")
@@ -233,9 +235,14 @@ def handle(text):
                 say("Не могу найти звуки.")
         elif intent == "[ACTION_PURR]":
             say("[happy] Мур мур мур~")
+        elif intent == llm.ROUTER_REJECTED:
+            say("Не поняла.")
         elif intent in intents.ACTION_INTENTS or intent in ("[ACTION_WEATHER]", "[ACTION_READ]", "[ACTION_SCREEN]"):
             t0 = time.monotonic()
-            result = execute_pc_action(intent, text, task, CTX) or "Не удалось."
+            if routed_phrase is not None:
+                result = execute_routed(intent, routed_phrase, task, CTX) or "Не удалось."
+            else:
+                result = execute_pc_action(intent, text, task, CTX) or "Не удалось."
             dt = time.monotonic() - t0
             if dt > 1.5:
                 print(f"⏱ {intent} выполнялся {dt:.1f} c")

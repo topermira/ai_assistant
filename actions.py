@@ -110,6 +110,18 @@ def _tg_send(ctx, contact, text, fallback_notepad=False):
     return TG_SERVICE.send_to_dialog(dialog, label, rewritten)
 
 
+def execute_routed(intent, phrase, extracted_task="", ctx=None):
+    """Команда, которую понял LLM-роутер. Действию отдаём КАНОНИЧЕСКУЮ фразу роутера: исходную регулярки уже
+    не поняли (поэтому и сработал роутер) — раньше open/type/window отвечали «Не поняла», create делал «Новый файл».
+    Белый список интентов проверен в llm.llm_route; подтверждения — внутри execute_pc_action, как у обычных команд."""
+    ctx = ctx or ActionContext({})
+    if intent == "[ACTION_SCREEN]" and not ctx.config.get("send_screenshots_to_cloud", False):
+        # «глянь, что там» распознала нейросеть, а не шаблон — без «да» снимок окна в облако не уходит
+        if not ctx.confirm("Показать активное окно облачной нейросети? Картинка уйдёт в интернет.", force=True):
+            return "Хорошо, не смотрю."
+    return execute_pc_action(intent, phrase, extracted_task, ctx)
+
+
 def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
     ctx = ctx or ActionContext({})
     lower = user_text.lower()

@@ -435,6 +435,36 @@ def _canonical(name, a):
     return None
 
 
+# Во что МОЖЕТ превратиться фраза каждого инструмента. Остальное — отказ «Не поняла»: «напечатай выключи компьютер»
+# не должно стать выключением, «закрой» + «все окна» — закрытием всех окон. Опасных интентов (удаление, выключение,
+# завершение процессов, отправка файлов) здесь нет вовсе; Telegram-отправка спрашивает «да» всегда (force).
+ROUTER_INTENTS = {
+    "open_target": {"[ACTION_OPEN]"},
+    "weather": {"[ACTION_WEATHER]"},
+    "create_item": {"[ACTION_CREATE]"},
+    "window_action": {"[ACTION_WINDOW]"},
+    "type_text": {"[ACTION_TYPE]"},
+    "write_code": {"[ACTION_CODE_FILE]"},
+    "telegram_send": {"[ACTION_TG_SEND]"},
+    "telegram_read": {"[ACTION_TG_READ]"},
+    "set_timer": {"[ACTION_TIMER]"},
+    "remind": {"[ACTION_REMIND]"},
+    "media": {"[ACTION_MEDIA]", "[ACTION_VOLUME]"},
+    "look_at_screen": {"[ACTION_SCREEN]"},
+}
+ROUTER_REJECTED = "[ROUTER_REJECTED]"     # роутер вызвал инструмент, но команда не прошла белый список → «Не поняла»
+
+
+class Routed(tuple):
+    """(intent, task) от роутера + каноническая фраза. Распаковывается как обычная пара; phrase нужна действию:
+    OPEN/TYPE/WINDOW/CREATE разбирают текст регулярками, а исходную фразу они уже не поняли."""
+
+    def __new__(cls, intent, task, phrase="", tool=""):
+        self = super().__new__(cls, (intent, task))
+        self.phrase, self.tool = phrase, tool
+        return self
+
+
 def router_phrase_ok(name, phrase, user_text):
     """«сдвинь на 100» роутер превращал в «громкость 100» и выкручивал звук. Громкость — только если в исходной фразе
     действительно есть слова про звук."""
@@ -458,18 +488,24 @@ def llm_route(user_text):
                 args = json.loads(fn.arguments or "{}")
             except Exception:
                 args = {}
-            phrase = _canonical(fn.name, args)
+            allowed = ROUTER_INTENTS.get(fn.name)
+            phrase = _canonical(fn.name, args) if allowed else None
             print(f"🧭 Роутер: {fn.name} → «{phrase}»")
-            if phrase and not router_phrase_ok(fn.name, phrase, user_text):
+            if not phrase:
+                print(f"🧭 Роутер: инструмент «{fn.name}» не из списка — не выполняю")
+                return Routed(ROUTER_REJECTED, "", "", fn.name)
+            if not router_phrase_ok(fn.name, phrase, user_text):
                 print("🧭 Роутер: фраза не про громкость, игнорирую")
                 return None
-            if phrase:
-                intent, task = intents.get_intent(phrase, code_analyzer=None, llm_router=None)
-                if intent == "[ACTION_CODE_FILE]" and not task:
-                    task = str(args.get("task") or "")
-                if intent not in ("[CHAT]", "[TEXT]"):
-                    return intent, task
-            return None
+            intent, task = intents.get_intent(phrase, code_analyzer=None, llm_router=None)
+            if intent not in allowed:
+                print(f"🧭 Роутер: «{phrase}» → {intent}, а {fn.name} допускает только {sorted(allowed)} — не выполняю")
+                return Routed(ROUTER_REJECTED, "", phrase, fn.name)
+            if intent == "[ACTION_CODE_FILE]" and not task:
+                task = str(args.get("task") or "")
+            if intent == "[ACTION_SCREEN]":
+                task = (user_text or "").strip() or task     # вопрос пользователя целиком, а не «что на экране»
+            return Routed(intent, task, phrase, fn.name)
         if "TEXT" in (msg.content or "").upper():
             return "[TEXT]", ""
         return None
