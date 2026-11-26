@@ -144,12 +144,33 @@ def test_late_reminders_fire_with_note(planner):
     assert all("таблетку" not in d and "сверни" not in d for d in planner.list_plans())   # команда — пропуск, как раньше
     assert [(g["text"], g["late_min"]) for g in planner.due(datetime(2026, 11, 27, 14, 0))] == [("про планёрку", 300)]
     assert planner.due(datetime(2026, 11, 27, 14, 1)) == []                                 # второй раз за день — нет
-    assert planner.due(datetime(2026, 11, 28, 15, 30)) == []                                # больше 6 ч — пропуск
+    missed = planner.due(datetime(2026, 11, 28, 15, 30))                                    # больше 6 ч — не молча
+    assert [(g["text"], g.get("missed"), g.get("late_min")) for g in missed] == [("про планёрку", True, None)]
+    assert planner.due(datetime(2026, 11, 28, 15, 31)) == []                                # и только один раз
     on_time = planner.due(datetime(2026, 11, 29, 9, 5))
     assert on_time[0]["text"] == "про планёрку" and "late_min" not in on_time[0]            # 5 минут — без пометки
     assert scenarios.reminder_phrase("выпить таблетку", 150) == "Опоздала на 2 часа 30 минут. Напоминаю: выпить таблетку."
     assert scenarios.reminder_phrase("про планёрку", 21) == "Опоздала на 21 минуту. Напоминаю про планёрку."
     assert scenarios.reminder_phrase("про планёрку") == "Напоминаю про планёрку."
+    assert scenarios.reminder_phrase("выпить таблетку", missed=True) == "Пропустила напоминание: выпить таблетку."
+    assert scenarios.reminder_phrase("про планёрку", missed=True) == "Пропустила напоминание про планёрку."
+
+
+def test_missed_reminder_once_and_commands_still_skipped(planner):
+    MORNING = datetime(2026, 11, 26, 8, 0)
+    planner.add_plan(spec("в 9:00 напомни выпить таблетку", MORNING))   # разовое, 26.11
+    planner.add_plan(spec("в 9:00 сверни все окна", MORNING))           # команда, 26.11
+    planner.add_plan(spec("каждый день в 9:00 скажи погоду"))         # команда, каждый день
+    got = planner.due(datetime(2026, 11, 26, 20, 0))                  # ПК включили через 11 часов
+    assert [(g["kind"], g["text"], g.get("missed")) for g in got] == [("remind", "выпить таблетку", True)]
+    assert planner.list_plans() == ["каждый день в 09:00 — скажи погоду"]   # разовые убраны, команда не выполнялась
+    assert planner.due(datetime(2026, 11, 26, 20, 1)) == []
+
+
+def test_reminder_fired_on_time_is_not_reported_missed_later(planner):
+    planner.add_plan(spec("каждый день в 9:00 напомни про планёрку"))
+    assert [g["text"] for g in planner.due(datetime(2026, 11, 26, 9, 0, 5))] == ["про планёрку"]
+    assert planner.due(datetime(2026, 11, 26, 16, 0)) == []            # уже сказала сегодня — «пропустила» не нужно
 
 
 def test_broken_schedule_record_is_skipped(tmp_path):

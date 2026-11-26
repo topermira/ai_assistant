@@ -146,7 +146,8 @@ def _on_plan_due(p):
     import scenarios
     print(f"🗓 По расписанию: {p['text']}")
     if p["kind"] == "remind":
-        _on_timer(scenarios.reminder_phrase(p["text"], p.get("late_min")))     # «Опоздала на …», если ПК спал
+        # «Опоздала на …», если ПК спал; проспано больше 6 часов — «Пропустила напоминание: …»
+        _on_timer(scenarios.reminder_phrase(p["text"], p.get("late_min"), missed=p.get("missed", False)))
         return
     _notify_phone(f"🗓 По расписанию: {p['text']}")
     stt.PAUSE_WAKE.set()                 # микрофон свободен для «да/нет», если команда спросит подтверждение

@@ -99,13 +99,25 @@ def format_duration(secs):
 
 POLL_SEC = 1.0                       # как часто фоновый поток сверяет часы
 LATE_NOTE_SEC = 60                   # опоздание больше минуты (ПК спал) — говорим «Опоздала на …»
-MAX_OVERDUE_SEC = 6 * 3600           # опоздание больше — таймер выбрасывается, как в restore()
+MAX_OVERDUE_SEC = 6 * 3600           # опоздание больше — уже не «опоздала», а «Пропустила напоминание: …»
 
 
 def late_note(late_sec):
     """«Опоздала на 5 минут. » — округляем до минут; «1 минуту», а не «1 минута» (после «на»)."""
     mins = max(1, int(round(late_sec / 60.0)))
     return f"Опоздала на {format_duration(mins * 60).replace('минута', 'минуту')}. "
+
+
+_RE_MSG_PREFIX = re.compile(r"^(?:(?:Пока меня не было, сработало|Пропустила напоминание|Напоминаю)\s*:\s*)+", re.IGNORECASE)
+
+
+def missed_phrase(message):
+    """Проспано больше MAX_OVERDUE_SEC: «Напоминаю: чайник.» → «Пропустила напоминание: чайник.»
+    Свои пометки («Пока меня не было…», «Напоминаю: …», прежнее «Пропустила…») не дублируем."""
+    t = _RE_MSG_PREFIX.sub("", (message or "").strip()).strip().rstrip(".!").strip()
+    if not t or t.lower() == "напоминаю":
+        return "Пропустила напоминание."
+    return f"Пропустила напоминание: {t}."
 
 
 class TimerManager:
@@ -158,7 +170,7 @@ class TimerManager:
 
     def restore(self, max_overdue=MAX_OVERDUE_SEC, startup_delay=4.0):
         """Поднять сохранённые таймеры. Просроченные не больше чем на max_overdue секунд сработают сразу
-        (с пометкой), совсем старые выбрасываются. Возвращает (восстановлено, просрочено_сработает)."""
+        (с пометкой), более старые — «Пропустила напоминание: …». Возвращает (восстановлено, просрочено_сработает)."""
         if not self._path or not os.path.exists(self._path):
             return 0, 0
         try:
@@ -179,9 +191,11 @@ class TimerManager:
                 if left > 0:
                     self._schedule(at, msg)
                     pending += 1
-                elif -left <= max_overdue:
-                    # по одному в секунду, после прогрева голоса; «Опоздала на …» не добавляем — пометка уже своя
-                    self._schedule(now + startup_delay + overdue, "Пока меня не было, сработало: " + msg, note_late=False)
+                else:
+                    # по одному в секунду, после прогрева голоса; «Опоздала на …» не добавляем — пометка уже своя.
+                    # Совсем старые раньше выбрасывались молча — теперь хотя бы скажем, что пропустила.
+                    text = "Пока меня не было, сработало: " + msg if -left <= max_overdue else missed_phrase(msg)
+                    self._schedule(now + startup_delay + overdue, text, note_late=False)
                     overdue += 1
             self._save()
         return pending, overdue
@@ -214,10 +228,12 @@ class TimerManager:
                     continue
                 del self._timers[tid]               # снят ДО колбэка: отмена во время срабатывания его не повторит
                 late = now - due_wall
-                if late > MAX_OVERDUE_SEC:
-                    print(f"⏰ Пропущен (ПК спал {format_duration(late)}): {msg}")
-                    continue
-                due.append(late_note(late) + msg if note_late and late > LATE_NOTE_SEC else msg)
+                if late > MAX_OVERDUE_SEC:                  # ПК спал/был выключен дольше 6 часов
+                    due.append(missed_phrase(msg))
+                elif note_late and late > LATE_NOTE_SEC:
+                    due.append(late_note(late) + msg)
+                else:
+                    due.append(msg)
             changed = len(due) > 0 or not self._timers
             if changed:
                 self._save()

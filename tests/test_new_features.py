@@ -203,7 +203,7 @@ def test_timers_persist_and_restore(tmp_path):
     assert json.load(open(path, encoding="utf-8")) == []
 
 
-def test_timers_overdue_fire_with_note_and_old_dropped(tmp_path):
+def test_timers_overdue_fire_with_note_and_old_announced(tmp_path):
     path = tmp_path / "timers.json"
     now = time.time()
     path.write_text(json.dumps([{"at": now - 60, "message": "свежее"}, {"at": now - 10 * 3600, "message": "древнее"},
@@ -211,9 +211,12 @@ def test_timers_overdue_fire_with_note_and_old_dropped(tmp_path):
     fired, ev = [], threading.Event()
     tm = TimerManager(lambda m: (fired.append(m), ev.set()), storage_path=str(path))
     pending, overdue = tm.restore(startup_delay=0.01)
-    assert (pending, overdue) == (0, 1)
+    assert (pending, overdue) == (0, 2)                   # мусорные записи пропущены, старое — не молча
     assert ev.wait(3)
-    assert fired == ["Пока меня не было, сработало: свежее"]
+    deadline = time.time() + 4
+    while len(fired) < 2 and time.time() < deadline:
+        time.sleep(0.05)
+    assert fired == ["Пока меня не было, сработало: свежее", "Пропустила напоминание: древнее."]
     tm.stop()
 
 

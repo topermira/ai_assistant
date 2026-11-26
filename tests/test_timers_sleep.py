@@ -60,16 +60,43 @@ def test_fired_after_wake_says_how_late(clock):
     tm.stop()
 
 
-def test_overslept_more_than_limit_is_dropped(clock, tmp_path):
+def test_overslept_more_than_limit_says_missed(clock, tmp_path):
     path = str(tmp_path / "timers.json")
     fired, ev, cb = _fired_list()
     tm = TimerManager(cb, storage_path=path)
-    tm.add(60, "старое")
-    clock[0] += 60 + timers_mod.MAX_OVERDUE_SEC + 60   # больше 6 часов — как в restore(): выбрасываем
-    assert _wait(lambda: not tm._timers)
-    assert not ev.wait(0.1) and fired == []
+    tm.add(60, "Напоминаю: чайник.")
+    clock[0] += 60 + timers_mod.MAX_OVERDUE_SEC + 60   # больше 6 часов — не молча, а «пропустила»
+    assert ev.wait(3) and fired == ["Пропустила напоминание: чайник."]
     assert json.load(open(path, encoding="utf-8")) == []
+    clock[0] += 3600
+    time.sleep(0.1)
+    assert len(fired) == 1                             # один раз
     tm.stop()
+
+
+def test_restore_very_old_says_missed_after_startup(clock, tmp_path):
+    path = tmp_path / "timers.json"
+    path.write_text(json.dumps([{"at": clock[0] - 3 * 86400, "message": "Напоминаю: позвонить маме."},
+                                {"at": clock[0] - 60, "message": "Напоминаю!"}]), encoding="utf-8")
+    fired, ev, cb = _fired_list()
+    tm = TimerManager(cb, storage_path=str(path))
+    assert tm.restore(startup_delay=10) == (0, 2)
+    assert not ev.wait(0.1)                            # сначала прогрев голоса
+    clock[0] += 12
+    assert _wait(lambda: len(fired) == 2)
+    assert fired == ["Пропустила напоминание: позвонить маме.", "Пока меня не было, сработало: Напоминаю!"]
+    tm.stop()
+
+
+@pytest.mark.parametrize("msg,text", [
+    ("Напоминаю: чайник.", "Пропустила напоминание: чайник."),
+    ("Напоминаю!", "Пропустила напоминание."),
+    ("Пока меня не было, сработало: Напоминаю: чайник.", "Пропустила напоминание: чайник."),
+    ("Пропустила напоминание: чайник.", "Пропустила напоминание: чайник."),
+    ("Таймер закончился! Прошло 5 минут.", "Пропустила напоминание: Таймер закончился! Прошло 5 минут."),
+])
+def test_missed_phrase(msg, text):
+    assert timers_mod.missed_phrase(msg) == text
 
 
 def test_several_due_fire_in_order_with_one_thread(clock):
@@ -225,3 +252,17 @@ def test_add_after_stop_works_again(clock):
 ])
 def test_late_note(late, text):
     assert late_note(late) == text
+
+
+# ---------- напоминание по расписанию, проспанное больше 6 часов ----------
+from test_telegram_bot import main_mod  # noqa: E402,F401
+
+
+def test_plan_reminder_missed_is_spoken(main_mod, monkeypatch):
+    said, handled = [], []
+    monkeypatch.setattr(main_mod, "_on_timer", said.append)
+    monkeypatch.setattr(main_mod, "handle", handled.append)
+    main_mod._on_plan_due({"kind": "remind", "text": "про планёрку", "missed": True})
+    main_mod._on_plan_due({"kind": "remind", "text": "выпить таблетку", "late_min": 30})
+    assert said == ["Пропустила напоминание про планёрку.", "Опоздала на 30 минут. Напоминаю: выпить таблетку."]
+    assert handled == []
