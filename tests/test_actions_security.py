@@ -3,12 +3,18 @@ import os
 import sys
 import ctypes
 import importlib
+import subprocess
 from unittest.mock import MagicMock
 
 import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, ROOT)
+
+# volume.py при импорте собирает COM-интерфейс громкости на настоящем comtypes (ctypes.POINTER), а фикстура ниже
+# подменяет comtypes заглушкой. В полном прогоне volume уже импортирован другими тестами; при запуске одного этого
+# файла — нет, и импорт actions → intents → volume падал («AttributeError: __name__»). Поэтому — заранее, до заглушек.
+import volume  # noqa: E402,F401
 
 _STUBS = ["sounddevice", "soundfile", "pyautogui", "pyperclip", "pygetwindow", "pywinauto", "win32com",
           "win32com.client", "comtypes", "comtypes.client", "send2trash", "mss", "pytesseract", "keyboard", "vosk",
@@ -32,6 +38,14 @@ def actions_mod(monkeypatch):
         if (isinstance(f, str) and os.path.abspath(f).startswith(ROOT + os.sep)
                 and "site-packages" not in f and os.sep + ".venv" + os.sep not in f):
             sys.modules.pop(name, None)
+
+
+def test_this_file_runs_on_its_own():
+    """`pytest tests/test_actions_security.py` без остальных тестов (раньше фикстура actions_mod падала)."""
+    r = subprocess.run([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider", os.path.abspath(__file__),
+                        "-k", "not runs_on_its_own"], cwd=ROOT, capture_output=True, text=True, timeout=180,
+                       env={**os.environ, "PYTHONDONTWRITEBYTECODE": "1"})
+    assert r.returncode == 0, (r.stdout + r.stderr)[-3000:]
 
 
 def _ctx(actions_mod, answer, cfg=None):
