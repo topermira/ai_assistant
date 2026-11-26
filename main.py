@@ -608,8 +608,8 @@ if __name__ == "__main__":
         _pl.start(_on_plan_due)
         if _pl.plans or _pl.scenarios:
             print(f"🗓 Расписаний: {len(_pl.plans)}, сценариев: {len(_pl.scenarios)}")
-    except Exception as e:
-        print(f"⚠️ Расписания не запустились: {e}")
+    except Exception as plan_err:
+        print(f"⚠️ Расписания не запустились: {plan_err}")
     try:
         gui.start_gui(on_close=shutdown, on_text=on_typed)
     except KeyboardInterrupt:

@@ -156,7 +156,7 @@ def running_apps(limit=15):
             continue
     if not counts:
         return "Открытых окон не вижу."
-    nice = lambda e: e[:-4] if e.endswith(".exe") else e
+    nice = lambda name: name[:-4] if name.endswith(".exe") else name
     items = [f"{nice(e)} ({n} окна)" if 2 <= n <= 4 else f"{nice(e)} ({n} окон)" if n > 4 else nice(e)
              for e, n in sorted(counts.items(), key=lambda kv: -kv[1])]
     more = f" и ещё {len(items) - limit}" if len(items) > limit else ""
