@@ -101,7 +101,13 @@ class TgRemote:
         if text.startswith(PREFIX.strip()):                    # свои ответы (и подписи к своим снимкам) не читаем
             return
         msg = getattr(event, "message", None)
+        # Пересланное — чужой текст или чужое голосовое: ни командой, ни ответом «да/нет» оно не считается.
+        # Пересланный файл по-прежнему сохраняем в «Загрузки» — это не команда.
+        forwarded = bool(getattr(msg, "fwd_from", None))
         if getattr(msg, "voice", None):
+            if forwarded:
+                self.log("↪️ Пересланное голосовое в чате управления — не выполняю")
+                return
             if self.waiting:                                    # голосом можно ответить «да/нет» на вопрос
                 threading.Thread(target=self._voice_answer, args=(msg,), daemon=True, name="tg-voice").start()
             else:
@@ -113,6 +119,9 @@ class TgRemote:
             self.jobs.put(("__file__", msg))                  # файл с телефона → «Загрузки»
             return
         if not text:
+            return
+        if forwarded:
+            self.log("↪️ Пересланное сообщение в чате управления — не выполняю как команду")
             return
         if self.waiting:
             self.answers.put(text)

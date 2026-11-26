@@ -68,6 +68,28 @@ def test_files_from_phone_are_queued_and_own_photos_ignored():
     assert kind == "__file__"
 
 
+def fwd(text, **media):
+    m = types.SimpleNamespace(fwd_from=object(), voice=None, sticker=None, photo=None, document=None)
+    for k, v in media.items():
+        setattr(m, k, v)
+    return types.SimpleNamespace(raw_text=text, message=m)
+
+
+def test_forwarded_messages_are_not_commands():
+    r = make(lambda *a, **kw: None)
+    asyncio.run(r._on_msg(fwd("удали файл отчёт")))
+    asyncio.run(r._on_msg(fwd("", voice=object())))
+    assert r.jobs.empty()
+    r.waiting = True                                       # и ответом «да» на вопрос пересланное не считается
+    asyncio.run(r._on_msg(fwd("да")))
+    assert r.answers.empty()
+    r.waiting = False
+    asyncio.run(r._on_msg(fwd("", document=object())))     # пересланный файл — в «Загрузки», как раньше
+    assert r.jobs.get_nowait()[0] == "__file__"
+    asyncio.run(r._on_msg(ev("громкость 30")))            # своё сообщение — команда
+    assert r.jobs.get_nowait() == "громкость 30"
+
+
 def test_send_file_passes_through_to_chat():
     calls = []
 
