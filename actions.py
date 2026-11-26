@@ -114,12 +114,15 @@ def execute_routed(intent, phrase, extracted_task="", ctx=None):
     """Команда, которую понял LLM-роутер. Действию отдаём КАНОНИЧЕСКУЮ фразу роутера: исходную регулярки уже
     не поняли (поэтому и сработал роутер) — раньше open/type/window отвечали «Не поняла», create делал «Новый файл».
     Белый список интентов проверен в llm.llm_route; подтверждения — внутри execute_pc_action, как у обычных команд."""
-    ctx = ctx or ActionContext({})
-    if intent == "[ACTION_SCREEN]" and not ctx.config.get("send_screenshots_to_cloud", False):
-        # «глянь, что там» распознала нейросеть, а не шаблон — без «да» снимок окна в облако не уходит
-        if not ctx.confirm("Показать активное окно облачной нейросети? Картинка уйдёт в интернет.", force=True):
-            return "Хорошо, не смотрю."
-    return execute_pc_action(intent, phrase, extracted_task, ctx)
+    return execute_pc_action(intent, phrase, extracted_task, ctx or ActionContext({}))
+
+
+def _screen_to_cloud_ok(ctx):
+    """Снимок окна уходит в облачную нейросеть — без «да» (force: даже при confirm_dangerous=false) только с
+    send_screenshots_to_cloud=true. Один вопрос и для «что на экране», и для того же, понятого роутером."""
+    if ctx.config.get("send_screenshots_to_cloud", False):
+        return True
+    return ctx.confirm("Показать активное окно облачной нейросети? Картинка уйдёт в интернет.", force=True)
 
 
 def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
@@ -154,6 +157,8 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         return think_llm(f"Проанализируй текст: {sel}", "[CHAT]")
 
     if intent == "[ACTION_SCREEN]":
+        if not _screen_to_cloud_ok(ctx):
+            return "Хорошо, не смотрю."
         # вопрос пользователя целиком: «что думаешь?», «переведи», «как это исправить?» — а не только «что на экране»
         return read_screen_and_analyze(extracted_task or ("Объясни ошибку." if "ошибк" in lower else "Что на экране?"))
 

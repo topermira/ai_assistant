@@ -153,7 +153,7 @@ Bot API при этом не используется — работает, да
 |---|---|---|
 | `voice_mode` | `anime` | `anime` (RVC) или `fast` (Piper) |
 | `confirm_dangerous` | `true` | спрашивать «да/нет» перед удалением, закрытием окон и т.п. Telegram-отправки и отправка экрана в облако спрашивают всегда |
-| `send_screenshots_to_cloud` | `false` | `true` — не спрашивать перед отправкой окна в облачную нейросеть при поиске файла «на глаз» |
+| `send_screenshots_to_cloud` | `false` | `true` — не спрашивать перед отправкой окна в облачную нейросеть: «что на экране», «глянь на экран» и поиск файла «на глаз» |
 | `vision_allow_system_apps` | `false` | `true` — разрешить Vision-агенту работать в консоли, PowerShell, диспетчере задач |
 | `use_llm_router` | `true` | LLM-роутер для фраз, которые не поймали регулярки |
 | `rvc_worker`, `preload_whisper` | `true` | фоновый RVC и прогрев Whisper |

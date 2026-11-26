@@ -150,6 +150,44 @@ def test_routed_screen_asks_before_cloud_and_keeps_question(actions_mod, monkeyp
     assert not asked5 and look.call_count == 2
 
 
+def test_routed_screen_asks_only_once(actions_mod, monkeypatch):
+    monkeypatch.setattr(actions_mod, "read_screen_and_analyze", MagicMock(return_value="ок"))
+    ctx, asked = _ctx(actions_mod, True)
+    actions_mod.execute_routed("[ACTION_SCREEN]", "что на экране", "глянь сюда", ctx)
+    assert len(asked) == 1
+
+
+# ---------- «что на экране» без роутера: тот же вопрос ----------
+@pytest.mark.parametrize("phrase", ["что на экране", "глянь на экран, что думаешь?", "объясни ошибку"])
+def test_plain_screen_asks_before_cloud(actions_mod, monkeypatch, phrase):
+    import intents
+    intent, task = intents.get_intent(phrase)
+    assert intent == "[ACTION_SCREEN]"
+    look = MagicMock(return_value="Вижу код.")
+    monkeypatch.setattr(actions_mod, "read_screen_and_analyze", look)
+    ctx, asked = _ctx(actions_mod, False)                                         # «нет» — снимок не уходит
+    assert actions_mod.execute_pc_action(intent, phrase, task, ctx) == "Хорошо, не смотрю."
+    assert asked and not look.called
+    ctx2, asked2 = _ctx(actions_mod, False, cfg={"confirm_dangerous": False})    # force: спросит даже так
+    actions_mod.execute_pc_action(intent, phrase, task, ctx2)
+    assert asked2 and not look.called
+    actions_mod.execute_pc_action(intent, phrase, task, actions_mod.ActionContext({}, confirm=None))   # некого спросить
+    assert not look.called
+    ctx3, asked3 = _ctx(actions_mod, True)                                        # «да» — с вопросом пользователя
+    assert actions_mod.execute_pc_action(intent, phrase, task, ctx3) == "Вижу код." and look.call_args[0][0] == task
+    ctx4, asked4 = _ctx(actions_mod, False, cfg={"send_screenshots_to_cloud": True})   # разрешено в настройках
+    actions_mod.execute_pc_action(intent, phrase, task, ctx4)
+    assert not asked4 and look.call_count == 2
+
+
+def test_launcher_screenshot_label_matches_behavior():
+    import settings
+    src = open(os.path.join(ROOT, "roxy_launcher.py"), encoding="utf-8").read()
+    line = next(ln for ln in src.splitlines() if '"send_screenshots_to_cloud"' in ln)
+    assert "что на экране" in line and "выключено — каждый раз спросит" in line and line.rstrip().endswith("False),")
+    assert settings._default_config()["send_screenshots_to_cloud"] is False      # по умолчанию — спрашивать
+
+
 def test_routed_telegram_send_still_asks(actions_mod, monkeypatch):
     monkeypatch.setattr(actions_mod, "_init_telegram_if_needed", lambda cfg: (True, "ok"))
     monkeypatch.setattr(actions_mod, "_tg_find", lambda c: ("dlg", "Вася"))
