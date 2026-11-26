@@ -46,6 +46,20 @@ def test_delay_compound_and_clock():
     assert power.parse_delay("выключи компьютер", now) == 0
 
 
+def test_bare_hour_takes_nearest_future():
+    at = lambda h, m=0: datetime.datetime(2026, 1, 1, h, m)
+    assert power.parse_delay("выключи комп в 11", at(15)) == 8 * 3600              # → 23:00
+    assert power.parse_delay("выключи комп в 11", at(10, 30)) == 30 * 60           # → 11:00
+    assert power.parse_delay("выключи комп в 9", at(22)) == 11 * 3600              # → 9:00 завтра (21:00 — позже)
+    assert power.parse_delay("выключи комп в 12", at(15)) == 9 * 3600              # → полночь
+    assert power.parse_delay("выключи комп в 11:30", at(15)) == 8 * 3600 + 30 * 60
+    assert power.parse_delay("выключи комп в 11 утра", at(15)) == 20 * 3600        # «утра» — как сказано
+    assert power.parse_delay("выключи комп в 23", at(15)) == 8 * 3600              # 24-часовое — как раньше
+    asked = []
+    power.run("shutdown", 8 * 3600, lambda q: asked.append(q) or False)           # подтверждение остаётся
+    assert asked == ["Выключить компьютер через 8 ч?"]
+
+
 @pytest.mark.parametrize("phrase", ["выключи компьютер через немного", "выключи компьютер к 23:00",
                                     "выключи компьютер завтра", "выключи компьютер вечером"])
 def test_delay_named_but_unclear(phrase):

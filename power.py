@@ -20,8 +20,16 @@ _RE_TIME_WORDS = re.compile(r"\d|\b(?:через|утр\w*|вечер\w*|ноч\
                             r"сегодня|завтра|послезавтра)\b")
 
 
+def _seconds_until(hh, mm, now):
+    t = now.replace(hour=hh % 24, minute=mm, second=0, microsecond=0)
+    if t <= now:
+        t += datetime.timedelta(days=1)
+    return int((t - now).total_seconds())
+
+
 def parse_delay(lower, now=None):
     """Секунды до выключения: «через 30 минут», «через час десять минут», «в 23:30», «в 11 вечера», «в 23».
+    «В 11» без «утра/вечера/дня/ночи» — ближайшее из 11:00 и 23:00 (в 15:00 → 23:00, в 10:30 → 11:00).
     Время не названо — 0 (сейчас). Названо, но не разобрано («к 23:00», «завтра», «вечером») — UNKNOWN.
     Разбор — общий с таймерами (timers.parse_duration) и расписаниями (scenarios.parse_clock): раньше здесь был
     свой, и «через час десять минут» давало 10 минут, а «в 11 вечера» — «сейчас»."""
@@ -32,10 +40,10 @@ def parse_delay(lower, now=None):
     clock = parse_clock(lower)
     if clock:
         hh, mm, _start, _end, part, _explicit = clock
-        t = now.replace(hour=apply_part(hh, part) % 24, minute=mm, second=0, microsecond=0)
-        if t <= now:
-            t += datetime.timedelta(days=1)
-        return int((t - now).total_seconds())
+        hours = [apply_part(hh, part)]
+        if part is None and 1 <= hh <= 12:           # 12-часовое без уточнения: что раньше наступит
+            hours.append(hh + 12)
+        return min(_seconds_until(h, mm, now) for h in hours)
     return UNKNOWN if _RE_TIME_WORDS.search(lower) else 0
 
 
