@@ -141,6 +141,24 @@ def _on_timer(message):
         say(message, default_emotion="happy")
 
 
+def _on_plan_due(p):
+    """Сработало расписание («каждый день в 8 скажи погоду»): напоминание — как таймер, команда — как будто её сказали."""
+    import scenarios
+    print(f"🗓 По расписанию: {p['text']}")
+    if p["kind"] == "remind":
+        _on_timer(scenarios.reminder_phrase(p["text"]))
+        return
+    _notify_phone(f"🗓 По расписанию: {p['text']}")
+    stt.PAUSE_WAKE.set()                 # микрофон свободен для «да/нет», если команда спросит подтверждение
+    try:
+        with _handle_lock:
+            handle(p["text"])
+    except Exception as e:
+        print(f"❌ Расписание «{p['text']}»: {type(e).__name__}: {e}")
+    finally:
+        stt.PAUSE_WAKE.clear()
+
+
 TIMERS = TimerManager(_on_timer, storage_path=os.path.join(settings.PROJECT_DIR, "timers.json"))
 CTX = ActionContext(config, confirm=confirm, timers=TIMERS, remote=_remote_channel)
 
@@ -493,6 +511,11 @@ def _start_live2d():
 def _cleanup():
     """Вызывается при ЛЮБОМ выходе: стоп-слово, кнопка X, Ctrl+C. Раньше Live2D оставался висеть."""
     TIMERS.stop()          # потоки останавливаем, а файл timers.json оставляем: напоминания переживут выключение
+    try:
+        import scenarios
+        scenarios.get_planner().stop()
+    except Exception:
+        pass
     LIVE2D.stop()
     try:
         from rvc_client import WORKER
@@ -579,6 +602,14 @@ if __name__ == "__main__":
     _pending, _overdue = TIMERS.restore(startup_delay=10.0)
     if _pending or _overdue:
         print(f"⏰ Таймеры восстановлены: ждут {_pending}, просрочено (сработают сейчас) {_overdue}")
+    try:
+        import scenarios
+        _pl = scenarios.get_planner()
+        _pl.start(_on_plan_due)
+        if _pl.plans or _pl.scenarios:
+            print(f"🗓 Расписаний: {len(_pl.plans)}, сценариев: {len(_pl.scenarios)}")
+    except Exception as e:
+        print(f"⚠️ Расписания не запустились: {e}")
     try:
         gui.start_gui(on_close=shutdown, on_text=on_typed)
     except KeyboardInterrupt:

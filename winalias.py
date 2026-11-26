@@ -3,6 +3,7 @@
 Зачем: на Windows с нидерландским/английским интерфейсом у «Блокнота» в заголовке не «Блокнот», а «Kladblok»/«Notepad»,
 поэтому «закрой блокнот» не находила окно. Ищем по процессу (notepad.exe) и по заголовку на нескольких языках.
 """
+import re
 
 # русское имя → (подстроки заголовка в нижнем регистре, имя процесса или None)
 APP_ALIASES = {
@@ -27,6 +28,36 @@ BROWSER_EXES = {"chrome.exe", "msedge.exe", "browser.exe", "firefox.exe", "opera
 def _key(title):
     t = (title or "").strip().lower().strip(" .,!?«»\"'")
     return _ALIAS_FORMS.get(t, t)
+
+
+# «открой новое окно яндекса»: у браузеров на Chromium/Firefox есть ключ «новое окно». Имя — по началу слова (яндекса, хрома…).
+_NEW_WINDOW = [
+    (("яндекс", "yandex"), 'start "" browser --new-window'),
+    (("хром", "chrome"), 'start "" chrome --new-window'),
+    (("эдж", "едж", "edge"), 'start "" msedge --new-window'),
+    (("фаерфокс", "файрфокс", "фаерфокс", "firefox", "мозил"), 'start "" firefox -new-window'),
+    (("браузер",), 'start "" chrome --new-window'),            # как «браузер» в APP_DICT
+]
+_RE_NEW_WINDOW = re.compile(r"\bнов(?:ое|ый|ую|ого|ом|ым)\s+окн\w*\b")
+
+
+def split_new_window(raw):
+    """«новое окно яндекса» / «яндекс в новом окне» → (True, 'яндекс'); без «нового окна» → (False, raw)."""
+    m = _RE_NEW_WINDOW.search((raw or "").lower())
+    if not m:
+        return False, raw
+    rest = (raw[:m.start()] + " " + raw[m.end():]).lower()
+    rest = re.sub(r"\b(?:в|во|для|у|на|ещё|еще)\b", " ", rest)
+    return True, re.sub(r"\s+", " ", rest).strip(" .,!?")
+
+
+def new_window_command(name):
+    """Команда запуска нового окна браузера по имени («яндекса», «хром») или None."""
+    n = (name or "").lower().strip()
+    for stems, cmd in _NEW_WINDOW:
+        if any(n.startswith(s) for s in stems):
+            return cmd
+    return None
 
 
 def needles(title):

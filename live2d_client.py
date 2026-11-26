@@ -17,6 +17,7 @@ class Live2DClient:
         self._lock = threading.Lock()
         self._running = False
         self._was_connected = False
+        self._waiters = {}            # имя поведения → {"ev": Event, "res": dict} — ждём ответ окна («села» / «не на что»)
 
     @property
     def connected(self):
@@ -70,6 +71,12 @@ class Live2DClient:
                 data = json.loads(msg)
             except (TypeError, ValueError):
                 continue
+            if isinstance(data, dict) and data.get("type") == "behavior_result":
+                w = self._waiters.pop(data.get("name"), None)
+                if w:
+                    w["res"] = data
+                    w["ev"].set()
+                continue
             cb = self.on_event
             if cb and isinstance(data, dict):
                 try:
@@ -92,6 +99,19 @@ class Live2DClient:
                     if self._was_connected:
                         print("🔌 Live2D отключился, буду переподключаться.")
                 return False
+
+    def behavior_result(self, name, timeout=2.5):
+        """Послать поведение и дождаться ответа окна: {'ok': bool, 'reason': str} или None, если окно не ответило
+        (старая версия окна, оно занято, нет связи). Нужен для честного «села» / «не получилось»."""
+        w = {"ev": threading.Event(), "res": None}
+        self._waiters[name] = w
+        if not self.send("behavior", name=name):
+            self._waiters.pop(name, None)
+            return None
+        if not w["ev"].wait(timeout):
+            self._waiters.pop(name, None)
+            return None
+        return w["res"]
 
     # удобные обёртки
     def mouth(self, value):

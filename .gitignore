@@ -49,3 +49,7 @@ __pycache__/
 *.bak
 timers.json
 timers.json.tmp
+schedules.json
+schedules.json.tmp
+scenarios.json
+scenarios.json.tmp

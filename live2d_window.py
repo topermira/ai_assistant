@@ -982,6 +982,7 @@ class Live2DWindow(QMainWindow):
             return False
         work = self._work()
         skipped = 0
+        self._perch_why = ""
         wins = _top_windows(int(self.winId()))
         for h in wins:
             l, t, r, b = self._rect_logical(h)
@@ -999,8 +1000,10 @@ class Live2DWindow(QMainWindow):
             print("🪟 Прыгаю на окно")
             return True
         if not wins:
+            self._perch_why = "все окна развёрнуты на весь экран или свёрнуты — сверни или уменьши одно"
             print("🪟 Не на что сесть: все окна развёрнуты на весь экран или свёрнуты.")
         else:
+            self._perch_why = f"у {skipped} окон верхний край слишком высоко, голова не поместится на экране — опусти окно пониже"
             need = int(f[3] * (1 - self.perch_frac_max) + 10 + work.top())
             print(f"🪟 Не на что сесть: у {skipped} окон верх выше {need} px, голова ушла бы за экран. "
                   f"Опусти окно пониже или уменьши Рокси: \"live2d_height\" в config.json.")
@@ -1012,6 +1015,9 @@ class Live2DWindow(QMainWindow):
             self._dozing = False
             self._js("setDoze(false)")                # любая команда будит
         if self.mode in ("drag", "acro") or not self._feet():
+            if name == "perch":
+                self._send_main({"type": "behavior_result", "name": "perch", "ok": False,
+                                 "reason": "я сейчас занята (кувыркаюсь или меня держат мышкой) или ещё не измерила себя — повтори через пару секунд"})
             return
         self._edge_abort()
         if name == "dance_music":
@@ -1049,7 +1055,10 @@ class Live2DWindow(QMainWindow):
         elif name in ("handstand", "cartwheel"):
             self._acro(name)
         elif name == "perch":
-            if not self._perch():
+            ok = self._perch()
+            self._send_main({"type": "behavior_result", "name": "perch", "ok": bool(ok),
+                             "reason": getattr(self, "_perch_why", "")})      # main.py отвечает честно, а не «Сажусь»
+            if not ok:
                 self._js("gesture('shake')")      # некуда садиться
         elif name == "floor":
             self.land_on = None

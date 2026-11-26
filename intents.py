@@ -10,6 +10,7 @@ import mediacap
 import pcctl
 import phonefiles
 import power
+import scenarios
 import syscmd
 
 from volume import parse_volume_command
@@ -306,7 +307,7 @@ def type_target(lower):
 
 
 ACTION_INTENTS = {
-    "[ACTION_POWER]", "[ACTION_BRIGHTNESS]", "[ACTION_CAPTURE]", "[ACTION_MOUSE]", "[ACTION_KEYS]", "[ACTION_SYS]", "[ACTION_PHONE]",
+    "[ACTION_POWER]", "[ACTION_BRIGHTNESS]", "[ACTION_CAPTURE]", "[ACTION_PLAN]", "[ACTION_MOUSE]", "[ACTION_KEYS]", "[ACTION_SYS]", "[ACTION_PHONE]",
     "[ACTION_OPEN]", "[ACTION_TYPE]", "[ACTION_CREATE]", "[ACTION_NEW_TAB]", "[ACTION_CODE_FILE]",
     "[ACTION_WINDOW]", "[ACTION_RENAME]", "[ACTION_MAXIMIZE_CURSOR]", "[ACTION_MAXIMIZE_FULL]",
     "[ACTION_SHOW_GUI]", "[ACTION_HIDE_GUI]", "[ACTION_CLEAR_TEXT]", "[ACTION_CLEAR_CONTEXT]",
@@ -405,6 +406,8 @@ def get_intent(user_text, library_lookup=None, code_analyzer=None, llm_router=No
         return "[CHAT]", ""
     if _RE_STOP.match(text): return "[ACTION_STOP]", ""
     lower = text.lower()
+    sp = scenarios.parse(text)                   # расписания и сценарии — ДО power: «в 23:00 выключи компьютер» не должно выключать сейчас
+    if sp: return "[ACTION_PLAN]", sp[0]
     pw = power.parse(lower)                      # до «выключи звук» и «перезагрузи» (= F5)
     if pw: return "[ACTION_POWER]", f"{pw[0]}|{pw[1]}"
     br = pcctl.parse_brightness(lower)

@@ -184,7 +184,14 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
                 save_config(ctx.config)
             except Exception:
                 pass
-        if not LIVE2D.send("behavior", name=extracted_task):
+        if extracted_task == "perch":
+            # окно отвечает, села ли она: раньше «Сажусь на окно» говорилось всегда, а потом аватар жаловался «не на что сесть»
+            if not LIVE2D.connected:
+                return "Окно Live2D не подключено."
+            res = LIVE2D.behavior_result("perch")
+            if res is not None and not res.get("ok"):
+                return "Не получилось сесть на окно: " + (res.get("reason") or "подходящего окна нет") + "."
+        elif not LIVE2D.send("behavior", name=extracted_task):
             return "Окно Live2D не подключено."
         # Без тега эмоции: раньше «[happy]» добавлял радостный подскок к каждой команде («иди сюда» → прыжки)
         return {"autonomy_off": "Стою на месте.", "autonomy_on": "Гуляю сама.", "jump": "Прыгаю.", "flip": "Смотри, сальто!", "handstand": "Встаю на руки!", "cartwheel": "Колесо!",
@@ -491,6 +498,9 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
     if intent == "[ACTION_CAPTURE]":
         return _media_action(ctx, extracted_task)
 
+    if intent == "[ACTION_PLAN]":
+        return _plan_action(ctx, user_text)
+
     if intent == "[ACTION_BRIGHTNESS]":
         import pcctl
         kind, _, n = (extracted_task or "query|0").partition("|")
@@ -644,6 +654,19 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
                 return f"Файл не нашла, но открыла {prog}."
             return f"Не нашла '{fname}'."
 
+        want_new, nw_name = winalias.split_new_window(raw)
+        if want_new:                                          # «открой новое окно яндекса» — именно новое, а не показать старое
+            if not nw_name:
+                return "Новое окно чего? Скажи, например: «открой новое окно яндекса» или «…хрома»."
+            cmd = winalias.new_window_command(nw_name)
+            if not cmd:
+                return "Новое окно умею открывать у браузеров: Яндекс, Хром, Эдж, Фаерфокс."
+            try:
+                subprocess.Popen(cmd, shell=True, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception as e:
+                return f"Не получилось открыть новое окно: {e}"
+            return f"Открываю новое окно {nw_name}."
+
         prog_lower = raw.lower().strip()
         if prog_lower in APP_DICT:
             try:
@@ -769,6 +792,125 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         return "Осталось: " + "; ".join(f"{left} — {msg}" for left, msg in items)
 
     return None
+
+
+_PLAN_HELP = ("Скажи, например: «каждый день в 8:30 скажи погоду», «по будням в 9:00 напомни про планёрку», "
+              "«в 23:00 сверни все окна», «каждый понедельник в 10:00 запусти сценарий работа».")
+_RUNNABLE_EXTRA = {"[ACTION_WEATHER]", "[ACTION_READ]", "[ACTION_SCREEN]"}
+
+
+def _step_intent(step):
+    import intents
+    intent, task = intents.get_intent(step)               # без LLM-роутера: шаг должен быть понятной командой
+    if intent in intents.ACTION_INTENTS or intent in _RUNNABLE_EXTRA:
+        if intent in ("[ACTION_PLAN]", "[ACTION_STOP]"):
+            return None, None
+        return intent, task
+    return None, None
+
+
+def run_scenario(ctx, name, steps, pause=0.8):
+    """Шаги сценария по очереди, молча (говорит только итог). Возвращает текст ответа."""
+    done, notes, infos = 0, [], []
+    for i, step in enumerate(steps, 1):
+        intent, task = _step_intent(step)
+        if not intent:
+            notes.append(f"«{step}» — не похоже на команду, пропустила")
+            continue
+        try:
+            res = execute_pc_action(intent, step, task, ctx)
+        except Exception as e:
+            notes.append(f"«{step}» — ошибка {type(e).__name__}")
+            continue
+        print(f"   ▶ сценарий «{name}» {i}/{len(steps)}: {step} → {res}")
+        done += 1
+        if intent in ("[ACTION_WEATHER]", "[ACTION_TIME]", "[ACTION_READ]") and res:
+            infos.append(res)
+        if i < len(steps):
+            time.sleep(pause)                             # окна и программы успевают открыться
+    out = f"Сценарий «{name}»: выполнено {done} из {len(steps)}."
+    if infos:
+        out += " " + " ".join(infos)
+    if notes:
+        out += " Не вышло: " + "; ".join(notes) + "."
+    return out
+
+
+def _plan_action(ctx, user_text):
+    """Расписания («каждый день в 8 скажи погоду») и сценарии («создай сценарий работа: …»)."""
+    import scenarios
+    pl = scenarios.get_planner()
+    p = scenarios.parse(user_text)
+    if not p:
+        return "Не поняла, что запланировать. " + _PLAN_HELP
+    kind = p[0]
+    if kind == "plan_ask":
+        return "Не поняла расписание: нужны время и действие. " + _PLAN_HELP
+    if kind == "plan_add":
+        spec = p[1]
+        if spec["kind"] == "cmd" and _is_stop_phrase(spec["text"]):
+            return "«Стоп» по расписанию не ставлю."
+        pid = pl.add_plan(spec)
+        if pid is None:
+            return f"Расписаний уже {scenarios.MAX_PLANS} — удали ненужные («удали расписание 3»)."
+        items = pl.list_plans()
+        n = next((i for i, d in enumerate(items, 1) if d == scenarios.describe_plan(spec)), len(items))
+        extra = ""
+        m = re.match(r"^(?:запусти|выполни|включи)\s+сценари\w*\s+(.+)$", spec["text"])
+        if m and not pl.find_scenario(m.group(1))[0]:
+            extra = f" Такого сценария пока нет — создай: «создай сценарий {scenarios.clean_name(m.group(1))}: открой …, громкость 20»."
+        return f"Поставила: {scenarios.describe_plan(spec)}. Это расписание №{n}." + extra
+    if kind == "plan_list":
+        items = pl.list_plans()
+        if not items:
+            return "Расписаний нет. " + _PLAN_HELP
+        return "Расписание:\n" + "\n".join(f"{i}) {d}" for i, d in enumerate(items, 1))
+    if kind == "plan_del":
+        if p[1] == "ask":
+            return "Какое удалить? Скажи номер: «удали расписание 2» или «удали все расписания»."
+        if p[1] == "all":
+            if not pl.list_plans():
+                return "Расписаний нет."
+            if not ctx.confirm("Удалить все расписания?"):
+                return "Оставляю."
+            return f"Удалила расписаний: {pl.delete_plan('all')}."
+        return "Удалила расписание." if pl.delete_plan(p[1]) else "Нет расписания с таким номером. Список: «какое расписание»."
+    if kind == "scen_ask":
+        return "Скажи так: «создай сценарий работа: открой pycharm, громкость 20, открой яндекс»."
+    if kind == "scen_save":
+        name, steps = p[1], p[2]
+        bad = [s for s in steps if not _step_intent(s)[0]]
+        existed = pl.save_scenario(name, steps)
+        out = f"{'Обновила' if existed else 'Запомнила'} сценарий «{name}»: шагов {len(steps)}. Запуск: «запусти сценарий {name}»."
+        if bad:
+            out += " Эти шаги я пока не пойму как команды: " + "; ".join(f"«{b}»" for b in bad) + "."
+        return out
+    if kind == "scen_list":
+        names = list(pl.scenarios)
+        return ("Сценарии: " + ", ".join(names) + ".") if names else "Сценариев нет. Создай: «создай сценарий работа: открой pycharm, громкость 20»."
+    name = p[1]
+    real, steps = pl.find_scenario(name)
+    if kind == "scen_run":
+        if not real:
+            return f"Нет сценария «{name}»." + (f" Есть: {', '.join(steps)}." if steps else " Создай: «создай сценарий работа: открой pycharm, громкость 20».")
+        return run_scenario(ctx, real, steps)
+    if kind == "scen_show":
+        if not real:
+            return f"Нет сценария «{name}»."
+        return f"Сценарий «{real}»:\n" + "\n".join(f"{i}) {s}" for i, s in enumerate(steps, 1))
+    if kind == "scen_del":
+        if not real:
+            return f"Нет сценария «{name}»."
+        if not ctx.confirm(f"Удалить сценарий «{real}»?"):
+            return "Оставляю."
+        pl.delete_scenario(real)
+        return f"Удалила сценарий «{real}»."
+    return "Не поняла."
+
+
+def _is_stop_phrase(text):
+    import intents
+    return intents.get_intent(text)[0] == "[ACTION_STOP]"
 
 
 def _set_allow_media(ctx, on):
