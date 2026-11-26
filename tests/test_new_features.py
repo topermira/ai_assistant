@@ -229,23 +229,33 @@ def test_timers_without_storage_still_work():
     assert tm.describe() and tm.cancel_all() == 1
 
 
-def test_long_timer_waits_in_parts(monkeypatch):
+def test_long_timer_fires_once_without_parts(monkeypatch):
+    # раньше длинный таймер ждал частями по MAX_WAIT_SEC; теперь поток сверяет часы, и частей нет вовсе
+    import types
     import timers as timers_mod
-    monkeypatch.setattr(timers_mod, "MAX_WAIT_SEC", 0.05)
+    clock = [1_000_000.0]
+    monkeypatch.setattr(timers_mod, "time", types.SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(timers_mod, "POLL_SEC", 0.01)
     fired, ev = [], threading.Event()
     tm = TimerManager(lambda m: (fired.append(m), ev.set()))
-    tm.add(0.3, "длинный")
-    assert next(iter(tm._timers.values()))[0].interval <= 0.05    # Timer заведён на часть, а не на всё время
-    assert ev.wait(3) and fired == ["длинный"] and not tm._timers   # сработал один раз, в конце
+    tm.add(60 * 24 * 3600, "длинный")                               # 60 суток — больше threading.TIMEOUT_MAX
+    clock[0] += 60 * 24 * 3600 - 5
+    assert not ev.wait(0.2) and len(tm._timers) == 1                  # за 5 секунд до конца — ещё ждёт
+    clock[0] += 10
+    assert ev.wait(3) and fired == ["длинный"] and not tm._timers   # сработал один раз, в конце, без «опоздала»
+    tm.stop()
 
 
 def test_huge_timer_does_not_overflow():
     tm = TimerManager(lambda m: None)
     tm.add(2000 * 3600, "через 2000 часов")                         # больше threading.TIMEOUT_MAX (~49,7 суток)
-    t = next(iter(tm._timers.values()))[0]
-    assert t.interval <= threading.TIMEOUT_MAX and t.is_alive()
-    assert tm.describe()[0][1] == "через 2000 часов"
+    t = tm._thread
+    assert t is not None and t.is_alive()                           # поток ждёт по POLL_SEC — OverflowError неоткуда взяться
+    time.sleep(1.3)                                                 # хотя бы один проход опроса
+    assert t.is_alive() and tm.describe()[0][1] == "через 2000 часов"
     assert tm.cancel_all() == 1
+    t.join(3)
+    assert not t.is_alive()                                         # таймеров не осталось — поток завершился сам
 
 
 # ---------- RVC: зависший rvc-next.exe ----------

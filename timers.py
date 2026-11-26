@@ -97,18 +97,33 @@ def format_duration(secs):
     return " ".join(parts) or "0 секунд"
 
 
-MAX_WAIT_SEC = 7 * 24 * 3600         # одна часть ожидания длинного таймера (меньше threading.TIMEOUT_MAX)
+POLL_SEC = 1.0                       # как часто фоновый поток сверяет часы
+LATE_NOTE_SEC = 60                   # опоздание больше минуты (ПК спал) — говорим «Опоздала на …»
+MAX_OVERDUE_SEC = 6 * 3600           # опоздание больше — таймер выбрасывается, как в restore()
+
+
+def late_note(late_sec):
+    """«Опоздала на 5 минут. » — округляем до минут; «1 минуту», а не «1 минута» (после «на»)."""
+    mins = max(1, int(round(late_sec / 60.0)))
+    return f"Опоздала на {format_duration(mins * 60).replace('минута', 'минуту')}. "
 
 
 class TimerManager:
-    """Таймеры и напоминания. С storage_path переживают перезапуск: «Рокси, пока» больше не теряет напоминания."""
+    """Таймеры и напоминания. С storage_path переживают перезапуск: «Рокси, пока» больше не теряет напоминания.
+
+    Один фоновый поток раз в POLL_SEC сравнивает time.time() с абсолютным временем срабатывания (due_wall),
+    как Planner в scenarios.py. Раньше на каждый таймер был threading.Timer с относительной задержкой — а в Windows
+    время сна ПК в ней не учитывается: «через 10 минут» + сон на 5 минут срабатывало через 15. Поток живёт,
+    только пока есть таймеры, и сам завершается, когда их не осталось."""
 
     def __init__(self, on_fire, storage_path=None):
         self._on_fire = on_fire      # on_fire(message)
-        self._timers = {}            # tid -> (threading.Timer, due_monotonic, due_wall, message)
+        self._timers = {}            # tid -> (due_wall, message, note_late)
         self._lock = threading.Lock()
         self._next_id = 1
         self._path = storage_path
+        self._thread = None
+        self._stop_ev = threading.Event()
 
     # ---------- хранение ----------
     def _save(self):
@@ -116,7 +131,7 @@ class TimerManager:
         if not self._path:
             return
         try:
-            data = [{"at": due_wall, "message": msg} for _, _, due_wall, msg in self._timers.values()]
+            data = [{"at": due_wall, "message": msg} for due_wall, msg, _ in self._timers.values()]
             tmp = self._path + ".tmp"
             with open(tmp, "w", encoding="utf-8") as f:
                 json.dump(data, f, ensure_ascii=False)
@@ -124,22 +139,24 @@ class TimerManager:
         except Exception as e:
             print(f"⚠️ timers: не смогла сохранить: {e}")
 
-    def _schedule(self, seconds, message, due_wall, tid=None, end=None):
-        """Длинные таймеры ждут частями по MAX_WAIT_SEC: если до конца ещё далеко, _fire заводит следующую часть
-        с тем же tid. Раньше «таймер на 2000 часов» падал в потоке с OverflowError (threading.TIMEOUT_MAX на Windows
-        ~49,7 суток), а запись оставалась в списке и в timers.json навсегда."""
-        if tid is None:
-            tid = self._next_id
-            self._next_id += 1
-        if end is None:
-            end = time.monotonic() + seconds
-        t = threading.Timer(min(max(0.0, seconds), MAX_WAIT_SEC), self._fire, args=(tid,))
-        t.daemon = True
-        self._timers[tid] = (t, end, due_wall, message)
-        t.start()
+    def _schedule(self, due_wall, message, note_late=True):
+        """Вызывать под self._lock. Длинные таймеры больше не делятся на части: поток ждёт по POLL_SEC, поэтому
+        «таймер на 2000 часов» не упирается в threading.TIMEOUT_MAX (~49,7 суток на Windows) и не даёт OverflowError."""
+        tid = self._next_id
+        self._next_id += 1
+        self._timers[tid] = (float(due_wall), message, note_late)
+        self._ensure_thread()
         return tid
 
-    def restore(self, max_overdue=6 * 3600, startup_delay=4.0):
+    def _ensure_thread(self):
+        """Вызывать под self._lock: один поток на менеджер, заводим, если его нет."""
+        if self._thread is not None and self._thread.is_alive():
+            return
+        self._stop_ev = threading.Event()
+        self._thread = threading.Thread(target=self._loop, args=(self._stop_ev,), daemon=True, name="timers")
+        self._thread.start()
+
+    def restore(self, max_overdue=MAX_OVERDUE_SEC, startup_delay=4.0):
         """Поднять сохранённые таймеры. Просроченные не больше чем на max_overdue секунд сработают сразу
         (с пометкой), совсем старые выбрасываются. Возвращает (восстановлено, просрочено_сработает)."""
         if not self._path or not os.path.exists(self._path):
@@ -160,10 +177,11 @@ class TimerManager:
                     continue
                 left = at - now
                 if left > 0:
-                    self._schedule(left, msg, at)
+                    self._schedule(at, msg)
                     pending += 1
                 elif -left <= max_overdue:
-                    self._schedule(startup_delay + overdue, "Пока меня не было, сработало: " + msg, now)
+                    # по одному в секунду, после прогрева голоса; «Опоздала на …» не добавляем — пометка уже своя
+                    self._schedule(now + startup_delay + overdue, "Пока меня не было, сработало: " + msg, note_late=False)
                     overdue += 1
             self._save()
         return pending, overdue
@@ -171,46 +189,70 @@ class TimerManager:
     # ---------- работа ----------
     def add(self, seconds, message):
         with self._lock:
-            tid = self._schedule(seconds, message, time.time() + seconds)
+            tid = self._schedule(time.time() + seconds, message)
             self._save()
             return tid
 
-    def _fire(self, tid):
+    def _loop(self, stop_ev):
+        while not stop_ev.wait(POLL_SEC):
+            try:
+                if not self._tick(stop_ev):
+                    return
+            except Exception as e:
+                print(f"⚠️ timers: {type(e).__name__}: {e}")
+
+    def _tick(self, stop_ev):
+        """Один проход: снять под замком всё, чему пора, и вызвать on_fire уже без замка (иначе отмена
+        или новый таймер из колбэка ждали бы озвучку). → False, когда потоку пора завершиться."""
+        now = time.time()
+        due = []
         with self._lock:
-            item = self._timers.get(tid)
-            if item is None:                 # отменили, пока ждали замок
-                return
-            _, end, due_wall, message = item
-            left = end - time.monotonic()
-            if left > 1.0:                   # прошла очередная часть длинного таймера — ждём дальше
-                self._schedule(left, message, due_wall, tid=tid, end=end)
-                return
-            del self._timers[tid]
-            self._save()
-        try:
-            self._on_fire(message)
-        except Exception as e:
-            print(f"⚠️ timer: {e}")
+            if stop_ev.is_set():
+                return False
+            for tid, (due_wall, msg, note_late) in sorted(self._timers.items(), key=lambda kv: kv[1][0]):
+                if due_wall > now:
+                    continue
+                del self._timers[tid]               # снят ДО колбэка: отмена во время срабатывания его не повторит
+                late = now - due_wall
+                if late > MAX_OVERDUE_SEC:
+                    print(f"⏰ Пропущен (ПК спал {format_duration(late)}): {msg}")
+                    continue
+                due.append(late_note(late) + msg if note_late and late > LATE_NOTE_SEC else msg)
+            changed = len(due) > 0 or not self._timers
+            if changed:
+                self._save()
+            if not self._timers and not due:
+                if self._thread is threading.current_thread():
+                    self._thread = None             # таймеров нет — поток не держим; add() заведёт новый
+                return False
+        for message in due:
+            if stop_ev.is_set():
+                break
+            try:
+                self._on_fire(message)
+            except Exception as e:
+                print(f"⚠️ timer: {e}")
+        return True
 
     def cancel_all(self):
         """Отмена по просьбе пользователя: таймеры исчезают И из файла."""
         with self._lock:
             n = len(self._timers)
-            for t, _, _, _ in self._timers.values():
-                t.cancel()
             self._timers.clear()
             self._save()
         return n
 
-    def stop(self):
-        """Остановить потоки при выходе, НЕ трогая сохранённый файл — таймеры поднимутся при следующем запуске."""
+    def stop(self, timeout=2.0):
+        """Остановить поток при выходе, НЕ трогая сохранённый файл — таймеры поднимутся при следующем запуске."""
         with self._lock:
-            for t, _, _, _ in self._timers.values():
-                t.cancel()
             self._timers.clear()
+            self._stop_ev.set()
+            t, self._thread = self._thread, None
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout)
 
     def describe(self):
         with self._lock:
-            items = sorted(self._timers.values(), key=lambda x: x[1])
-        now = time.monotonic()
-        return [(format_duration(max(0, end - now)), msg) for _, end, _, msg in items]
+            items = sorted(self._timers.values(), key=lambda x: x[0])
+        now = time.time()
+        return [(format_duration(max(0, due_wall - now)), msg) for due_wall, msg, _ in items]
