@@ -40,6 +40,26 @@ def test_pairing_and_strangers():
     assert b.sent[-1] == (9, "Это личный бот.") and not b._jobs
 
 
+def test_pairing_locks_after_five_wrong_codes():
+    logs = []
+    b = FakeBot()
+    b.log = logs.append
+    code = b._pair_code()
+    wrong = "/start 000000" if code != "000000" else "/start 111111"
+    for _ in range(telegram_bot.PAIR_MAX_FAILS):
+        b._on_update(upd(wrong, uid=9, chat=9))
+    attempts = [m for m in logs if "неверный код привязки" in m]
+    assert len(attempts) == 5 and all("Telegram ID 9" in m for m in attempts)        # кто и когда — в журнале
+    assert b.owner is None and b.sent[-1] == (9, telegram_bot.PAIR_LOCKED)
+    new = b.code
+    assert new and any(f"/start {new}" in m for m in logs)                           # новый код — в журнале
+    b._on_update(upd(f"/start {new}"))                                               # в паузу не принимается даже верный
+    assert b.owner is None and b.sent[-1] == (5, telegram_bot.PAIR_LOCKED)
+    b._pair_locked_until = 0.0                                                       # пауза прошла
+    b._on_update(upd(f"/start {new}"))
+    assert b.owner == 5
+
+
 def test_command_and_reply():
     b = FakeBot(owner=5)
     b._on_update(upd("громкость 30"))

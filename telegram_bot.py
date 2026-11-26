@@ -46,6 +46,10 @@ if not getattr(socket.getaddrinfo, "_roxy_v4", False):
 HELP = ("Я Рокси. Пиши мне как голосом: «выключи компьютер через час», «громкость 30», "
         "«поставь таймер на 10 минут», «что на экране».\n"
         "/screen — снимок экрана\n/unlink — отвязать этот телефон")
+_NOT_YOURS = "Это личный бот. Код привязки показан в журнале Рокси на компьютере: /start <код>"
+PAIR_MAX_FAILS = 5          # неверных кодов привязки подряд — новый код и пауза (код из 6 цифр иначе можно подобрать)
+PAIR_LOCK_SEC = 600
+PAIR_LOCKED = "Слишком много неверных кодов. Попробуй через 10 минут."
 
 
 class RoxyBot:
@@ -59,6 +63,8 @@ class RoxyBot:
         self.log = log
         self.offset = None
         self.code = None
+        self._pair_fails = 0
+        self._pair_locked_until = 0.0
         self._stop = threading.Event()
         self._answers = {}                  # chat_id -> queue ответов на «да/нет»
         self._waiting = set()
@@ -173,13 +179,7 @@ class RoxyBot:
             return
         owner = self.get_owner()
         if not owner:
-            if text.startswith("/start") and self.code and text.split()[-1] == self.code:
-                self.set_owner(int(user))
-                self.code = None
-                self.log(f"📱 Телефон привязан (Telegram ID {user})")
-                self.send(chat, "Готово, теперь я слушаюсь тебя здесь. " + HELP)
-            else:
-                self.send(chat, "Это личный бот. Код привязки показан в журнале Рокси на компьютере: /start <код>")
+            self._pairing(chat, user, text)
             return
         if int(user) != int(owner):
             self.send(chat, "Это личный бот.")
@@ -197,6 +197,39 @@ class RoxyBot:
             return
         self._jobs.append((chat, text))
         self._job_ev.set()
+
+    def _pairing(self, chat, user, text):
+        """«/start <код>» от телефона, пока бот ни к кому не привязан. Каждый неверный код — в журнал (кто и когда);
+        после PAIR_MAX_FAILS неверных — новый код и пауза PAIR_LOCK_SEC, в паузу не принимается даже верный."""
+        parts = text.split()
+        guess = parts[-1] if text.startswith("/start") and len(parts) > 1 else None
+        if guess is None or not self.code:
+            self.send(chat, _NOT_YOURS)
+            return
+        stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+        if time.monotonic() < self._pair_locked_until:
+            self.log(f"⚠️ Бот: попытка привязки во время паузы — Telegram ID {user}, {stamp}")
+            self.send(chat, PAIR_LOCKED)
+            return
+        if guess == self.code:
+            self.set_owner(int(user))
+            self.code = None
+            self._pair_fails = 0
+            self.log(f"📱 Телефон привязан (Telegram ID {user})")
+            self.send(chat, "Готово, теперь я слушаюсь тебя здесь. " + HELP)
+            return
+        self._pair_fails += 1
+        self.log(f"⚠️ Бот: неверный код привязки — Telegram ID {user}, {stamp} "
+                 f"(попытка {self._pair_fails} из {PAIR_MAX_FAILS})")
+        if self._pair_fails < PAIR_MAX_FAILS:
+            self.send(chat, _NOT_YOURS)
+            return
+        self._pair_fails = 0
+        self._pair_locked_until = time.monotonic() + PAIR_LOCK_SEC
+        self.code = None
+        self.log(f"📱 Бот: {PAIR_MAX_FAILS} неверных кодов подряд — привязка закрыта на {PAIR_LOCK_SEC // 60} минут. "
+                 f"Новый код (после паузы): /start {self._pair_code()}")
+        self.send(chat, PAIR_LOCKED)
 
     def _worker(self):
         while not self._stop.is_set():
