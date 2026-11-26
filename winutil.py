@@ -379,7 +379,8 @@ def _find_file(name):
 
 def _find_file_ex(name):
     """→ (путь, нечёткое) или (None, False). Нечёткое — имя нашлось только похожее («отчет1.docx» → «отчет2.docx»):
-    удаление и отправка такого файла спрашивают отдельно, а программы по нему без вопроса не запускаются."""
+    удаление и отправка такого файла спрашивают отдельно, а программы по нему без вопроса не запускаются.
+    Имя без расширения, совпавшее полностью («телеграм» → «Телеграм.lnk»), — точное совпадение."""
     if not name: return None, False
     name = name.strip(" .,!?«»\"'")
     if not name: return None, False
@@ -416,13 +417,19 @@ def _find_file_ex(name):
     for v in list(variants):
         if not v.endswith("ь"): variants.append(v + "ь")
     all_files = {}
+    same_stem = None                  # «телеграм» → «Телеграм.lnk»: отличается только расширение — это не «похожее»
     for base in search_dirs:
         if not base or not os.path.isdir(base): continue
         try:
             for entry in os.listdir(base):
                 full = os.path.join(base, entry)
-                if os.path.isfile(full): all_files[entry.lower()] = full
+                if os.path.isfile(full):
+                    all_files[entry.lower()] = full
+                    if same_stem is None and os.path.splitext(entry)[0].lower() == name_low:
+                        same_stem = full
         except OSError: continue
+    if same_stem:
+        return same_stem, False
     if all_files:
         all_lower = list(all_files.keys())
         for v in variants:

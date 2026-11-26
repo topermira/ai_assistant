@@ -68,21 +68,48 @@ def test_regular_file_delete_still_works_after_confirm(actions_mod, monkeypatch,
     assert not trash.called
 
 
-def test_find_file_marks_fuzzy_matches(actions_mod, monkeypatch, tmp_path):
+@pytest.fixture()
+def fake_desktop(actions_mod, monkeypatch, tmp_path):
+    """Поиск файлов winutil — только по временному «рабочему столу» (настоящие папки не трогаем)."""
     wu = sys.modules["winutil"]
     desk = tmp_path / "desk"
     desk.mkdir()
-    (desk / "отчет2.docx").write_text("x", encoding="utf-8")
-    (desk / "документ.exe").write_bytes(b"MZ")
     monkeypatch.setattr(wu, "DESKTOP_PATH", str(desk))
     monkeypatch.setattr(wu, "get_active_explorer_path", lambda *a, **k: None)
     monkeypatch.setattr(wu, "_safe_known", lambda name: str(tmp_path / "нет"))
     monkeypatch.setattr(wu.os.path, "expanduser", lambda p: str(tmp_path / "нет"))
+    return wu, desk
+
+
+def test_find_file_marks_fuzzy_matches(fake_desktop):
+    wu, desk = fake_desktop
+    (desk / "отчет2.docx").write_text("x", encoding="utf-8")
+    (desk / "Телеграм.lnk").write_bytes(b"L")
+    (desk / "документ.exe").write_bytes(b"MZ")
     assert wu._find_file_ex("отчет2.docx") == (str(desk / "отчет2.docx"), False)
-    assert wu._find_file_ex("отчет1.docx") == (str(desk / "отчет2.docx"), True)    # нашлось только похожее
-    assert wu._find_file_ex("документ") == (str(desk / "документ.exe"), True)
+    assert wu._find_file_ex("отчет1.docx") == (str(desk / "отчет2.docx"), True)    # другое имя — только похожее
+    assert wu._find_file_ex("телеграм") == (str(desk / "Телеграм.lnk"), False)     # отличается лишь расширение
+    assert wu._find_file_ex("документ") == (str(desk / "документ.exe"), False)
     assert wu._find_file_ex("совсем другое") == (None, False)
     assert wu._find_file("отчет1.docx") == str(desk / "отчет2.docx")              # старое имя — как раньше
+
+
+def test_shortcut_with_same_name_starts_without_question(actions_mod, fake_desktop, monkeypatch):
+    wu, desk = fake_desktop
+    lnk = desk / "Фотошоп.lnk"
+    lnk.write_bytes(b"L")
+    monkeypatch.setattr(actions_mod, "focus_if_running", lambda p: None)
+    started = []
+    monkeypatch.setattr(actions_mod.os, "startfile", lambda p: started.append(p), raising=False)
+    ctx, asked = _ctx(actions_mod, False, cfg={"confirm_dangerous": False})
+    assert actions_mod.execute_pc_action("[ACTION_OPEN]", "открой фотошоп", "", ctx) == "Открываю 'Фотошоп.lnk'."
+    assert started == [str(lnk)] and not asked
+    other = desk / "Фотошоп2024.lnk"                                  # другое имя — по-прежнему только похожее
+    other.write_bytes(b"L")
+    assert wu._find_file_ex("фотошоп2023") == (str(other), True)
+    started.clear()
+    assert actions_mod.execute_pc_action("[ACTION_OPEN]", "открой фотошоп2023", "", ctx) == "Не запускаю."
+    assert asked and "«Фотошоп2024.lnk»" in asked[0] and not started
 
 
 def test_fuzzy_delete_always_asks(actions_mod, monkeypatch, tmp_path):
