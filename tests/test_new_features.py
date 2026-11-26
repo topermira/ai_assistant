@@ -146,6 +146,7 @@ import agent_guard  # noqa: E402
     {"action": "press", "key": "winleft"}, {"action": "type", "text": "x" * 501},
     {"action": "hotkey", "keys": "win+r"}, {"action": "click", "x": "100", "y": 5}, {"action": "format_c"},
     {"action": "type", "text": ""}, {"action": "scroll", "clicks": 9999},
+    {"action": "hotkey", "keys": ["ctrl", "esc"]}, {"action": "hotkey", "keys": ["Ctrl", "Escape"]},
 ])
 def test_agent_guard_blocks(action):
     ok, why = agent_guard.validate_action(action)
@@ -155,7 +156,7 @@ def test_agent_guard_blocks(action):
 @pytest.mark.parametrize("action", [
     {"action": "click", "x": 10, "y": 20}, {"action": "type", "text": "привет"}, {"action": "press", "key": "enter"},
     {"action": "hotkey", "keys": ["ctrl", "s"]}, {"action": "scroll", "clicks": -3, "x": 1, "y": 2},
-    {"action": "done", "message": "ok"}, {"action": "wait", "seconds": 2},
+    {"action": "done", "message": "ok"}, {"action": "wait", "seconds": 2}, {"action": "press", "key": "esc"},
 ])
 def test_agent_guard_allows(action):
     assert agent_guard.validate_action(action)[0]
@@ -163,6 +164,8 @@ def test_agent_guard_allows(action):
 
 def test_agent_guard_system_processes():
     assert agent_guard.is_system_process("PowerShell.exe") and agent_guard.is_system_process("cmd.exe")
+    assert agent_guard.is_system_process("SearchHost.exe")
+    assert agent_guard.is_system_process("StartMenuExperienceHost.exe")
     assert not agent_guard.is_system_process("chrome.exe") and not agent_guard.is_system_process(None)
 
 

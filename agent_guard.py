@@ -11,6 +11,7 @@ BLOCKED_COMBOS = [
     {"alt", "f4"},                      # закрыть окно (потеря несохранённого)
     {"ctrl", "alt", "delete"}, {"ctrl", "alt", "del"},
     {"ctrl", "shift", "esc"},           # диспетчер задач
+    {"ctrl", "esc"}, {"ctrl", "escape"},  # меню «Пуск» без Win: оттуда набранная команда запускается по Enter
 ]
 
 # Процессы, в которые агент не должен попадать сам по себе: оболочки, реестр, диспетчер задач и т.п.
@@ -18,6 +19,7 @@ SYSTEM_PROCESSES = {
     "cmd.exe", "powershell.exe", "pwsh.exe", "powershell_ise.exe", "windowsterminal.exe", "wt.exe",
     "openconsole.exe", "conhost.exe", "regedit.exe", "mmc.exe", "taskmgr.exe", "wscript.exe", "cscript.exe",
     "msiexec.exe", "control.exe",
+    "searchhost.exe", "startmenuexperiencehost.exe",     # поиск и меню «Пуск»
 }
 
 
