@@ -62,6 +62,60 @@ def test_router_phrase_cannot_become_other_intent(llm_mod, monkeypatch, tool, ar
     assert r[0] not in ("[ACTION_CLOSE_ALL]", "[ACTION_POWER]", "[ACTION_DELETE_FILE]", "[ACTION_PLAN]", "[ACTION_PET]")
 
 
+# ---------- window / type / open: заявленный интент вместо чужого ----------
+@pytest.mark.parametrize("tool,args,intent,phrase", [
+    ("window_action", {"action": "сверни", "window": "телеграм"}, "[ACTION_WINDOW]", "сверни телеграм"),   # шаблоны: TG_HELP
+    ("window_action", {"action": "закрой", "window": "телеграм"}, "[ACTION_WINDOW]", "закрой телеграм"),
+    ("type_text", {"text": "выключи компьютер"}, "[ACTION_TYPE]", "напечатай выключи компьютер"),          # шаблоны: POWER
+    ("type_text", {"text": "удали файл отчёт"}, "[ACTION_TYPE]", "напечатай удали файл отчёт"),            # шаблоны: DELETE
+    ("open_target", {"target": "телеграм"}, "[ACTION_OPEN]", "открой телеграм"),                         # шаблоны: TG_HELP
+    ("open_target", {"target": "погоду"}, "[ACTION_OPEN]", "открой погоду"),                             # шаблоны: WEATHER
+])
+def test_router_forces_declared_intent(llm_mod, monkeypatch, tool, args, intent, phrase):
+    _stub_router(llm_mod, monkeypatch, tool, args)
+    r = llm_mod.llm_route("ну это самое")
+    assert (r[0], r[1], r.phrase) == (intent, "", phrase)
+
+
+@pytest.mark.parametrize("tool,args", [
+    ("window_action", {"action": "закрой", "window": "все окна"}),     # «все окна» → не «закрой активное»
+    ("window_action", {"action": "сверни", "window": "всё"}),
+    ("open_target", {"target": "выключи компьютер"}),                  # не запуск ярлыка выключения по имени
+    ("open_target", {"target": "удали файл отчёт"}),
+    ("create_item", {"name": "выключи компьютер"}),                     # остальные инструменты — строгий отказ
+    ("remind", {"minutes": 5, "what": "выключи компьютер"}),
+    ("telegram_read", {"contact": "напомни через 5 минут"}),
+])
+def test_router_does_not_force_dangerous_or_strict(llm_mod, monkeypatch, tool, args):
+    _stub_router(llm_mod, monkeypatch, tool, args)
+    assert llm_mod.llm_route("что-то такое")[0] == llm_mod.ROUTER_REJECTED
+
+
+def test_router_declared_stays_inside_whitelist(llm_mod):
+    for tool, intent in llm_mod.ROUTER_DECLARED.items():
+        assert intent in llm_mod.ROUTER_INTENTS[tool]
+    assert set(llm_mod.ROUTER_DECLARED) == {"window_action", "type_text", "open_target"}
+
+
+def test_routed_minimize_telegram_window(actions_mod, monkeypatch):
+    win = MagicMock(title="Telegram")
+    state = iter([False, True])                                   # до — развёрнуто, после — свёрнуто
+    monkeypatch.setattr(actions_mod, "window_minimized", lambda w: next(state))
+    find = MagicMock(return_value=win)
+    monkeypatch.setattr(actions_mod, "_find_window_by_title", find)
+    ctx, _ = _ctx(actions_mod, True)
+    res = actions_mod.execute_routed("[ACTION_WINDOW]", "сверни телеграм", "", ctx)
+    assert find.call_args[0][0] == "телеграм" and win.minimize.called and res == "Свернула 'Telegram'."
+
+
+def test_routed_type_types_command_words_as_text(actions_mod, monkeypatch):
+    typed = MagicMock(return_value=(True, "Блокнот"))
+    monkeypatch.setattr(actions_mod, "type_at_cursor", typed)
+    ctx, asked = _ctx(actions_mod, True)
+    actions_mod.execute_routed("[ACTION_TYPE]", "напечатай выключи компьютер", "", ctx)
+    assert typed.call_args[0][0] == "выключи компьютер" and not asked
+
+
 def test_router_rejects_closing_all_windows(llm_mod, monkeypatch):
     _stub_router(llm_mod, monkeypatch, "window_action", {"action": "закрой", "window": "все окна"})
     assert llm_mod.llm_route("позакрывай-ка всё")[0] == llm_mod.ROUTER_REJECTED

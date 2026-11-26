@@ -454,6 +454,35 @@ ROUTER_INTENTS = {
 }
 ROUTER_REJECTED = "[ROUTER_REJECTED]"     # роутер вызвал инструмент, но команда не прошла белый список → «Не поняла»
 
+# Если фраза этих инструментов разобралась шаблонами в чужой интент, выполняем заявленный (он из белого списка выше):
+# окно, печать и запуск сами разбирают «сверни …» / «напечатай …» / «открой …». Остальные инструменты — строгий отказ.
+ROUTER_DECLARED = {"window_action": "[ACTION_WINDOW]", "type_text": "[ACTION_TYPE]", "open_target": "[ACTION_OPEN]"}
+_RE_ALL_WINDOWS = re.compile(r"^\s*(?:вс[её]|все\s|всех\b|каждое\b|остальн)", re.IGNORECASE)
+
+
+# Шаблоны увидели в фразе опасное — подмены нет, только отказ. Иначе «открой выключи компьютер» стало бы запуском
+# по имени: _launch_by_name нашёл бы ярлык «Выключить компьютер» в меню Пуск и запустил его без вопроса.
+_NO_FORCE_OVER = {"[ACTION_POWER]", "[ACTION_SYS]", "[ACTION_DELETE_FILE]", "[ACTION_CLEAR_FOLDER]", "[ACTION_CLEAR_TEXT]",
+                  "[ACTION_PHONE]", "[ACTION_CLOSE_ALL]", "[ACTION_MINIMIZE_ALL]", "[ACTION_PLAN]", "[ACTION_CAPTURE]",
+                  "[ACTION_TG_SEND]", "[ACTION_TG_REPLY]", "[ACTION_TG_SEND_MAYBE]", "[ACTION_STOP]", "[ACTION_KEYS]",
+                  "[ACTION_MOUSE]"}
+
+
+def _force_declared(name, args, parsed_intent):
+    """Можно ли выполнить заявленный интент вместо разобранного. Печать — всегда (текст только печатается).
+    Запуск и окно — если шаблоны не нашли в фразе опасного; окно — только с конкретным названием:
+    «закрой» + «все окна» у действия окна превратилось бы в «закрой активное» — это отказ, а не подмена."""
+    if name not in ROUTER_DECLARED:
+        return False
+    if name == "type_text":
+        return True
+    if parsed_intent in _NO_FORCE_OVER:
+        return False
+    if name == "window_action":
+        w = str(args.get("window") or "").strip()
+        return bool(w) and not _RE_ALL_WINDOWS.match(w)
+    return True
+
 
 class Routed(tuple):
     """(intent, task) от роутера + каноническая фраза. Распаковывается как обычная пара; phrase нужна действию:
@@ -498,6 +527,11 @@ def llm_route(user_text):
                 print("🧭 Роутер: фраза не про громкость, игнорирую")
                 return None
             intent, task = intents.get_intent(phrase, code_analyzer=None, llm_router=None)
+            if intent not in allowed and _force_declared(fn.name, args, intent):
+                # «сверни телеграм» шаблоны читают как справку по Telegram, «напечатай выключи компьютер» — как
+                # выключение; а инструмент заявил окно/печать/запуск — его и выполняем (регулярка действия разберёт фразу)
+                print(f"🧭 Роутер: «{phrase}» → {intent}, выполняю заявленное {fn.name}")
+                intent, task = ROUTER_DECLARED[fn.name], ""
             if intent not in allowed:
                 print(f"🧭 Роутер: «{phrase}» → {intent}, а {fn.name} допускает только {sorted(allowed)} — не выполняю")
                 return Routed(ROUTER_REJECTED, "", phrase, fn.name)
