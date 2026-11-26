@@ -50,6 +50,24 @@ def test_plan_not_triggered_by_ordinary_commands():
     assert scenarios.parse("каждый день скажи погоду", NOW) == ("plan_ask",)      # время не назвали — переспросим
 
 
+def test_plan_needs_a_command():
+    for t in ["в 8 утра я проснулся и пошёл на работу", "каждый день в 8 утра я просыпаюсь",
+              "завтра в 9 я иду к врачу", "в 7 вечера мы ужинаем"]:
+        assert scenarios.parse(t, NOW) is None, t
+    assert get_intent("в 8 утра я проснулся и пошёл на работу")[0] != "[ACTION_PLAN]"
+    assert spec("в 23:00 громкость 10")["text"] == "громкость 10"                 # команда без глагола — тоже команда
+    assert spec("каждый день в 8 утра пожалуйста скажи погоду")["text"] == "пожалуйста скажи погоду"
+    assert spec("запланируй завтра в 9 звонок маме")["text"] == "звонок маме"     # «запланируй» — явная просьба
+    assert spec("каждый день в 8 напомни выпить таблетку")["kind"] == "remind"
+
+
+def test_scenario_run_needs_verb():
+    assert scenarios.parse("сценарий фильма классный", NOW) is None
+    assert get_intent("сценарий фильма классный")[0] != "[ACTION_PLAN]"
+    assert scenarios.parse("включи сценарий фильма классный") == ("scen_run", "фильма классный")
+    assert scenarios.parse("Рокси, выполни сценарий утро понедельника") == ("scen_run", "утро понедельника")
+
+
 def test_scenario_phrases():
     assert scenarios.parse("создай сценарий работа: открой pycharm, громкость 20, открой яндекс") == \
         ("scen_save", "работа", ["открой pycharm", "громкость 20", "открой яндекс"])
