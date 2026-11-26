@@ -16,6 +16,14 @@ def safe_filename(name):
     return name[:120]
 
 
+# Программы и скрипты: найденные по ПОХОЖЕМУ имени, без вопроса не запускаются («открой документ» ≠ «документ.exe»)
+EXECUTABLE_EXTS = {".exe", ".bat", ".cmd", ".ps1", ".vbs", ".js", ".msi", ".scr", ".lnk"}
+
+
+def is_executable(path):
+    return os.path.splitext(str(path or ""))[1].lower() in EXECUTABLE_EXTS
+
+
 def _norm(p):
     return os.path.normcase(os.path.abspath(os.path.expanduser(str(p)))).rstrip("\\/")
 

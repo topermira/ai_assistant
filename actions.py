@@ -17,7 +17,8 @@ from intents import (_RE_DELETE_FILE, _RE_CLEAR_FOLDER, _RE_MAXIMIZE_FULL, _RE_W
                      _RE_EXPLICIT_FOLDER, _FOLDER_KW, _WINDOW_NOISE, _WINDOW_NOISE_PREFIX, _clean_folder_query,
                      create_name)
 from winutil import (_force_foreground, _bring_to_front, _focus_new_app, _launch_by_name, _press_win_d,
-                     _press_hotkey, _find_folder, _find_file, _open_path, _send_to_trash, _clear_folder_contents,
+                     _press_hotkey, _find_folder, _find_file, _find_file_ex, _open_path, _send_to_trash,
+                     _clear_folder_contents,
                      count_folder_items, get_active_explorer_path, is_explorer_window, _clear_notepad,
                      insert_into_notepad, type_at_cursor, _find_window_by_title, _find_notepad_window,
                      set_text_if_empty, open_file_in_notepad, _safe_maximize, _close_all_windows, media_key,
@@ -33,7 +34,7 @@ from clock import say_now
 from textinput import type_text
 import volume
 from actionctx import ActionContext
-from pathsafe import safe_filename as _safe_filename, is_protected_path, is_clear_forbidden
+from pathsafe import safe_filename as _safe_filename, is_protected_path, is_clear_forbidden, is_executable
 
 
 GENERATED_CODE_DIR = os.path.join(PROJECT_DIR, "generated_code")
@@ -65,6 +66,14 @@ def _smart_find(ctx, query, kind):
 
 def _base(p):
     return os.path.basename(str(p).rstrip("/\\")) or str(p)
+
+
+def _fuzzy_run_ok(ctx, path, fuzzy):
+    """Программу или скрипт (.exe, .bat, .lnk…), найденные по ПОХОЖЕМУ имени, без вопроса не запускаем:
+    «открой документ» не должно запускать «документ.exe» из Загрузок."""
+    if not (fuzzy and is_executable(path)):
+        return True
+    return ctx.confirm(f"Нашла похожий файл «{_base(path)}» — это программа. Запустить?", force=True)
 
 
 
@@ -269,7 +278,10 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         raw = re.sub(r"\s+на\s+(?:рабочем\s+столе|desktop)\s*$", "", raw, flags=re.IGNORECASE)
         raw = raw.strip(" .,!?«»\"'")
         if not raw: return "Не поняла, что удалить."
-        target = _find_folder(raw) or _find_file(raw)
+        fuzzy = False
+        target = _find_folder(raw)
+        if not target:
+            target, fuzzy = _find_file_ex(raw)
         if not target: return f"Не нашла '{raw}'."
         is_dir = os.path.isdir(target)
         if is_dir and is_protected_path(target, PROJECT_DIR, (DESKTOP_PATH,)):
@@ -278,7 +290,10 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
         kind = "папку" if is_dir else "файл"
         where = _base(os.path.dirname(target))
         extra = f" В ней {count_folder_items(target)} объектов." if is_dir else ""
-        if not ctx.confirm(f"Удалить {kind} «{_base(target)}» из «{where}» в корзину?{extra}"):
+        question = f"Удалить {kind} «{_base(target)}» из «{where}» в корзину?{extra}"
+        if fuzzy:                            # нашлось только похожее имя — спрашиваем всегда, даже без confirm_dangerous
+            question = f"Точного «{raw}» нет, нашла похожий. " + question
+        if not ctx.confirm(question, force=fuzzy):
             return "Не удаляю."
         if _send_to_trash(target):
             return f"Удалила {kind} '{_base(target)}'."
@@ -638,12 +653,13 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
                 tokens = tokens[1:]
             fname = " ".join(tokens).strip()
             if not fname: return "Не поняла файл."
-            fp = _find_file(fname)
+            fp, fuzzy = _find_file_ex(fname)
             if not fp:
                 print(f"👁️ Vision: {fname}...")
                 cand = _smart_find(ctx, fname, "файл")
-                if cand: fp = _find_file(cand)
+                if cand: fp, fuzzy = _find_file_ex(cand)
             if fp:
+                if not _fuzzy_run_ok(ctx, fp, fuzzy): return "Не запускаю."
                 try:
                     os.startfile(fp)
                     _bring_to_front(os.path.basename(fp), timeout=2.0)
@@ -689,7 +705,7 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
                 _bring_to_front(base, timeout=3.0)
                 return f"Открываю папку '{base or p}'."
             if fn:
-                fp = _find_file(fn)
+                fp, fuzzy = _find_file_ex(fn)
                 if not fp:
                     cand = _smart_find(ctx, fn, "папка")
                     if cand:
@@ -697,19 +713,21 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
                         if fc:
                             os.startfile(fc)
                             return f"Открываю '{os.path.basename(fc)}'."
-                        fp = _find_file(cand)
+                        fp, fuzzy = _find_file_ex(cand)
                 if fp:
+                    if not _fuzzy_run_ok(ctx, fp, fuzzy): return "Не запускаю."
                     os.startfile(fp)
                     return f"Открываю '{os.path.basename(fp)}'."
                 return f"Не нашла '{fn}'."
             os.startfile(DESKTOP_PATH)
             return "Открываю рабочий стол."
 
-        fp = _find_file(raw)
+        fp, fuzzy = _find_file_ex(raw)
         if fp:
             try:
                 shown = focus_if_running(fp)          # программа уже открыта — показываем её окно, а не плодим новые
                 if shown: return f"'{raw}' уже открыт, показала окно '{shown}'."
+                if not _fuzzy_run_ok(ctx, fp, fuzzy): return "Не запускаю."
                 os.startfile(fp)
                 return f"Открываю '{os.path.basename(fp)}'."
             except Exception: pass
@@ -722,8 +740,9 @@ def execute_pc_action(intent, user_text, extracted_task="", ctx=None):
 
         cand = _smart_find(ctx, raw, "элемент")
         if cand:
-            fp = _find_file(cand)
+            fp, fuzzy = _find_file_ex(cand)
             if fp:
+                if not _fuzzy_run_ok(ctx, fp, fuzzy): return "Не запускаю."
                 os.startfile(fp)
                 return f"Открываю '{os.path.basename(fp)}'."
             fd = _find_folder(cand)
@@ -1042,7 +1061,7 @@ def _phone_action(ctx, kind, arg=""):
     if kind == "file":
         if not ctx.can_send_files():
             return _NO_PHONE
-        path = _find_file(arg)
+        path, fuzzy = _find_file_ex(arg)
         if not path:
             return f"Не нашла «{arg}» на рабочем столе, в Документах, Загрузках и открытой папке."
         if phonefiles.is_secret(path, PROJECT_DIR):
@@ -1050,6 +1069,9 @@ def _phone_action(ctx, kind, arg=""):
         size = os.path.getsize(path)
         if size > phonefiles.MAX_BYTES:
             return f"«{os.path.basename(path)}» слишком большой ({size // 1024 ** 2} МБ)."
+        if fuzzy and not ctx.confirm(f"Точного «{arg}» нет, нашла похожий: «{os.path.basename(path)}». Отправить его?",
+                                     force=True):
+            return "Не отправила."
         ok = ctx.send_file(path, os.path.basename(path), os.path.basename(path))
         return f"Скинула «{os.path.basename(path)}»." if ok else "Не получилось отправить файл."
     return "Не поняла."

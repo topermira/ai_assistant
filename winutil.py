@@ -374,12 +374,18 @@ def _find_folder(name):
     return None
 
 def _find_file(name):
-    if not name: return None
+    return _find_file_ex(name)[0]
+
+
+def _find_file_ex(name):
+    """→ (путь, нечёткое) или (None, False). Нечёткое — имя нашлось только похожее («отчет1.docx» → «отчет2.docx»):
+    удаление и отправка такого файла спрашивают отдельно, а программы по нему без вопроса не запускаются."""
+    if not name: return None, False
     name = name.strip(" .,!?«»\"'")
-    if not name: return None
+    if not name: return None, False
     name = re.sub(r"\s+\.", ".", name)
-    if os.path.isfile(name): return name
-    if os.path.isabs(name) and os.path.isfile(name): return name
+    if os.path.isfile(name): return name, False
+    if os.path.isabs(name) and os.path.isfile(name): return name, False
     name_low = name.lower()
     candidates = [name]
     if "." not in name:
@@ -397,12 +403,12 @@ def _find_file(name):
         if not base or not os.path.isdir(base): continue
         for c in candidates:
             p = os.path.join(base, c)
-            if os.path.isfile(p): return p
+            if os.path.isfile(p): return p, False
         try:
             for entry in os.listdir(base):
                 if entry.lower() == name_low:
                     full = os.path.join(base, entry)
-                    if os.path.isfile(full): return full
+                    if os.path.isfile(full): return full, False
         except OSError: continue
     variants = [name_low]
     trans = _translit_lat_to_cyr(name).lower()
@@ -424,8 +430,8 @@ def _find_file(name):
             if matches:
                 p = all_files[matches[0]]
                 print(f"🔎 Fuzzy-нашла '{os.path.basename(p)}' вместо '{name}'")
-                return p
-    return None
+                return p, True
+    return None, False
 
 def _open_path(path):
     try: os.startfile(path)

@@ -56,7 +56,7 @@ def test_regular_file_delete_still_works_after_confirm(actions_mod, monkeypatch,
     f = tmp_path / "отчёт.txt"
     f.write_text("x", encoding="utf-8")
     monkeypatch.setattr(actions_mod, "_find_folder", lambda name: None)
-    monkeypatch.setattr(actions_mod, "_find_file", lambda name: str(f))
+    monkeypatch.setattr(actions_mod, "_find_file_ex", lambda name: (str(f), False))
     trash = MagicMock(return_value=True)
     monkeypatch.setattr(actions_mod, "_send_to_trash", trash)
     ctx, asked = _ctx(actions_mod, True)
@@ -66,6 +66,73 @@ def test_regular_file_delete_still_works_after_confirm(actions_mod, monkeypatch,
     trash.reset_mock()
     assert actions_mod.execute_pc_action("[ACTION_DELETE_FILE]", "удали файл отчёт", "", ctx2) == "Не удаляю."
     assert not trash.called
+
+
+def test_find_file_marks_fuzzy_matches(actions_mod, monkeypatch, tmp_path):
+    wu = sys.modules["winutil"]
+    desk = tmp_path / "desk"
+    desk.mkdir()
+    (desk / "отчет2.docx").write_text("x", encoding="utf-8")
+    (desk / "документ.exe").write_bytes(b"MZ")
+    monkeypatch.setattr(wu, "DESKTOP_PATH", str(desk))
+    monkeypatch.setattr(wu, "get_active_explorer_path", lambda *a, **k: None)
+    monkeypatch.setattr(wu, "_safe_known", lambda name: str(tmp_path / "нет"))
+    monkeypatch.setattr(wu.os.path, "expanduser", lambda p: str(tmp_path / "нет"))
+    assert wu._find_file_ex("отчет2.docx") == (str(desk / "отчет2.docx"), False)
+    assert wu._find_file_ex("отчет1.docx") == (str(desk / "отчет2.docx"), True)    # нашлось только похожее
+    assert wu._find_file_ex("документ") == (str(desk / "документ.exe"), True)
+    assert wu._find_file_ex("совсем другое") == (None, False)
+    assert wu._find_file("отчет1.docx") == str(desk / "отчет2.docx")              # старое имя — как раньше
+
+
+def test_fuzzy_delete_always_asks(actions_mod, monkeypatch, tmp_path):
+    f = tmp_path / "отчет2.docx"
+    f.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(actions_mod, "_find_folder", lambda name: None)
+    monkeypatch.setattr(actions_mod, "_find_file_ex", lambda name: (str(f), True))
+    trash = MagicMock(return_value=True)
+    monkeypatch.setattr(actions_mod, "_send_to_trash", trash)
+    ctx, asked = _ctx(actions_mod, False, cfg={"confirm_dangerous": False})      # вопросы выключены — а тут спросит
+    assert actions_mod.execute_pc_action("[ACTION_DELETE_FILE]", "удали файл отчет1.docx", "", ctx) == "Не удаляю."
+    assert asked and "похожий" in asked[0] and "«отчет2.docx»" in asked[0] and not trash.called
+    monkeypatch.setattr(actions_mod, "_find_file_ex", lambda name: (str(f), False))
+    ctx2, asked2 = _ctx(actions_mod, False, cfg={"confirm_dangerous": False})    # точное имя — как раньше, без вопроса
+    assert actions_mod.execute_pc_action("[ACTION_DELETE_FILE]", "удали файл отчет2.docx", "", ctx2).startswith("Удалила")
+    assert not asked2
+
+
+def test_fuzzy_file_to_phone_asks(actions_mod, monkeypatch, tmp_path):
+    f = tmp_path / "отчет2.docx"
+    f.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(actions_mod, "_find_file_ex", lambda name: (str(f), True))
+    sent, asked = [], []
+    for answer in (False, True):
+        ctx = actions_mod.ActionContext({"confirm_dangerous": False}, confirm=lambda q: asked.append(q) or answer,
+                                        remote=lambda: (lambda d, n, c, p: sent.append(n), True))
+        res = actions_mod.execute_pc_action("[ACTION_PHONE]", "пришли файл отчет1.docx", "file|отчет1.docx", ctx)
+        assert res == ("Скинула «отчет2.docx»." if answer else "Не отправила.")
+    assert len(asked) == 2 and "«отчет2.docx»" in asked[0] and sent == ["отчет2.docx"]
+
+
+def test_fuzzy_match_does_not_start_program_without_asking(actions_mod, monkeypatch, tmp_path):
+    exe = tmp_path / "документ.exe"
+    exe.write_bytes(b"MZ")
+    monkeypatch.setattr(actions_mod, "_find_file_ex", lambda name: (str(exe), True))
+    monkeypatch.setattr(actions_mod, "focus_if_running", lambda p: None)
+    started = []
+    monkeypatch.setattr(actions_mod.os, "startfile", lambda p: started.append(p), raising=False)
+    ctx, asked = _ctx(actions_mod, False, cfg={"confirm_dangerous": False})
+    assert actions_mod.execute_pc_action("[ACTION_OPEN]", "открой документ", "", ctx) == "Не запускаю."
+    assert asked and "«документ.exe»" in asked[0] and not started
+    ctx2, _ = _ctx(actions_mod, True)
+    assert actions_mod.execute_pc_action("[ACTION_OPEN]", "открой документ", "", ctx2) == "Открываю 'документ.exe'."
+    assert started == [str(exe)]
+    doc = tmp_path / "документ.docx"
+    doc.write_text("x", encoding="utf-8")
+    monkeypatch.setattr(actions_mod, "_find_file_ex", lambda name: (str(doc), True))
+    ctx3, asked3 = _ctx(actions_mod, False)                    # не программа — открываем без вопроса, как раньше
+    assert actions_mod.execute_pc_action("[ACTION_OPEN]", "открой документ", "", ctx3) == "Открываю 'документ.docx'."
+    assert not asked3
 
 
 def test_clear_documents_refused_downloads_allowed(actions_mod, monkeypatch):
