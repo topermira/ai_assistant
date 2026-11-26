@@ -12,10 +12,16 @@ def test_not_pc_shutdown(phrase):
     assert get_intent(phrase)[0] != "[ACTION_POWER]"
 
 
-@pytest.mark.parametrize("phrase", ["выключи компьютер", "выключи комп", "выключи ноутбук"])
+@pytest.mark.parametrize("phrase", ["выключи компьютер", "выключи комп", "выключи ноутбук", "выключи виндовс",
+                                    "выключи винду"])
 def test_pc_shutdown(phrase):
     assert power.parse(phrase) == ("shutdown", 0)
     assert get_intent(phrase) == ("[ACTION_POWER]", "shutdown|0")
+
+
+def test_restart_windows_word():
+    assert power.parse("перезагрузи виндовс") == ("restart", 0)
+    assert power.parse("не выключай виндовс") == ("cancel", 0)
 
 
 def test_intents():
