@@ -152,6 +152,35 @@ def test_late_reminders_fire_with_note(planner):
     assert scenarios.reminder_phrase("про планёрку") == "Напоминаю про планёрку."
 
 
+def test_broken_schedule_record_is_skipped(tmp_path):
+    pl_path = tmp_path / "pl.json"
+    good = {"days": [3], "date": None, "time": "08:30", "kind": "cmd", "text": "скажи погоду", "last": None}
+    records = [good, {"days": "mon", "date": None, "time": "08:00", "kind": "cmd", "text": "x"},
+               {"days": [3], "date": None, "time": "25:99", "kind": "cmd", "text": "y"},
+               {"days": None, "date": "завтра", "time": "09:00", "kind": "remind", "text": "z"}, "мусор", 5]
+    pl_path.write_text(json.dumps(records, ensure_ascii=False), encoding="utf-8")
+    p = scenarios.Planner(str(tmp_path / "sc.json"), str(pl_path))
+    assert p.list_plans() == ["по четвергам в 08:30 — скажи погоду"]
+    assert json.loads((tmp_path / "pl.json.broken").read_text(encoding="utf-8")) == records   # копия до перезаписи
+    assert [d["text"] for d in p.due(datetime(2026, 11, 26, 8, 30, 10))] == ["скажи погоду"]
+
+
+def test_broken_schedule_file_is_kept_as_copy(tmp_path):
+    pl_path = tmp_path / "pl.json"
+    pl_path.write_text("[{битый", encoding="utf-8")
+    p = scenarios.Planner(str(tmp_path / "sc.json"), str(pl_path))
+    assert p.plans == [] and (tmp_path / "pl.json.broken").read_text(encoding="utf-8") == "[{битый"
+    p.add_plan(spec("каждый день в 9:00 скажи привет"))                 # новая запись копию не трогает
+    assert (tmp_path / "pl.json.broken").read_text(encoding="utf-8") == "[{битый"
+    assert len(json.loads(pl_path.read_text(encoding="utf-8"))) == 1
+
+
+def test_due_survives_bad_plan_in_memory(planner):
+    planner.add_plan(spec("каждый день в 8:30 скажи погоду"))
+    planner.plans.append({"id": 99, "days": "mon", "date": None, "time": "08:30", "kind": "cmd", "text": "x", "last": None})
+    assert [d["text"] for d in planner.due(datetime(2026, 11, 26, 8, 30, 10))] == ["скажи погоду"]
+
+
 def test_planner_delete_and_limits(planner):
     for h in (9, 10, 11):
         planner.add_plan(spec(f"каждый день в {h}:00 скажи привет"))

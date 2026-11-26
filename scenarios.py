@@ -15,6 +15,7 @@
 import json
 import os
 import re
+import shutil
 import threading
 import time
 from datetime import datetime, timedelta
@@ -372,6 +373,24 @@ def parse(text, now=None):
 
 
 # ---------------------------------------------------------------- хранение
+def _plan_from_file(p):
+    """Запись расписания (из schedules.json или в памяти) → план без id или None, если запись битая:
+    время не ЧЧ:ММ, нет текста, дни — не список чисел 0..6, у разового нет правильной даты."""
+    try:
+        t, text, days, date = str(p["time"]), str(p["text"]), p.get("days"), p.get("date")
+        if not re.fullmatch(r"\d\d:\d\d", t) or int(t[:2]) > 23 or int(t[3:]) > 59 or not text.strip():
+            return None
+        if days is None:
+            datetime.strptime(str(date), "%Y-%m-%d")
+        elif not (isinstance(days, list) and days and
+                  all(isinstance(d, int) and not isinstance(d, bool) and 0 <= d <= 6 for d in days)):
+            return None
+        return {"days": days, "date": date, "time": t, "kind": "remind" if p.get("kind") == "remind" else "cmd",
+                "text": text, "last": p.get("last")}
+    except (KeyError, TypeError, ValueError, AttributeError):
+        return None
+
+
 def _stem_eq(a, b):
     if a == b:
         return True
@@ -391,9 +410,21 @@ class Planner:
         self._thread = None
         self._stop = threading.Event()
         self.on_due = None
+        self._bad_warned = set()
         self._load()
 
     # ---- файлы
+    @staticmethod
+    def _backup_broken(path):
+        """Копия файла с битыми данными (<имя>.broken): при следующей записи они пропали бы насовсем."""
+        if not path or not os.path.exists(path):
+            return
+        try:
+            shutil.copy2(path, path + ".broken")
+            print(f"   копия сохранена: {os.path.basename(path)}.broken")
+        except OSError as e:
+            print(f"⚠️ {os.path.basename(path)}: не смогла сохранить копию .broken: {e}")
+
     @staticmethod
     def _read(path, default):
         if not path or not os.path.exists(path):
@@ -403,6 +434,8 @@ class Planner:
                 return json.load(f)
         except Exception as e:
             print(f"⚠️ {os.path.basename(path)}: не смогла прочитать: {e}")
+            if isinstance(e, ValueError):            # битый JSON (а не «файл занят»)
+                Planner._backup_broken(path)
             return default
 
     @staticmethod
@@ -421,17 +454,24 @@ class Planner:
         sc = self._read(self._sp, {})
         if isinstance(sc, dict):
             self.scenarios = {clean_name(k): [str(s) for s in v][:MAX_STEPS] for k, v in sc.items() if isinstance(v, list) and v}
+            if any(not (isinstance(v, list) and v) for v in sc.values()):
+                print("⚠️ scenarios.json: пропустила битые сценарии")
+                self._backup_broken(self._sp)
+        elif os.path.exists(self._sp or ""):
+            self._backup_broken(self._sp)
         pl = self._read(self._pp, [])
+        bad = 0
         for p in pl if isinstance(pl, list) else []:
-            try:
-                if not re.fullmatch(r"\d\d:\d\d", p["time"]) or not str(p["text"]).strip():
-                    continue
-                self.plans.append({"id": self._next_id, "days": p.get("days"), "date": p.get("date"), "time": p["time"],
-                                   "kind": "remind" if p.get("kind") == "remind" else "cmd", "text": str(p["text"]),
-                                   "last": p.get("last")})
-                self._next_id += 1
-            except (KeyError, TypeError):
+            plan = _plan_from_file(p)
+            if plan is None:                         # одна битая запись не мешает остальным
+                bad += 1
                 continue
+            plan["id"] = self._next_id
+            self._next_id += 1
+            self.plans.append(plan)
+        if bad or (not isinstance(pl, list) and os.path.exists(self._pp or "")):
+            print(f"⚠️ schedules.json: пропустила битых записей: {bad or 'весь файл'}")
+            self._backup_broken(self._pp)
 
     def _save_plans(self):
         self._write(self._pp, [{k: v for k, v in p.items() if k != "id"} for p in self.plans])
@@ -515,6 +555,11 @@ class Planner:
         with self._lock:
             changed = False
             for p in list(self.plans):
+                if _plan_from_file(p) is None:       # битая запись не должна останавливать остальные
+                    if p.get("id") not in self._bad_warned:
+                        self._bad_warned.add(p.get("id"))
+                        print(f"⚠️ расписание: битая запись пропущена: {p}")
+                    continue
                 hh, mm = map(int, p["time"].split(":"))
                 due_dt = datetime.combine(now.date(), datetime.min.time()).replace(hour=hh, minute=mm)
                 once = p["days"] is None
