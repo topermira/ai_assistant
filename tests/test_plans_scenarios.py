@@ -135,6 +135,23 @@ def test_planner_missed_runs(planner):
     assert all("выключи свет" not in d for d in planner.list_plans())
 
 
+def test_late_reminders_fire_with_note(planner):
+    planner.add_plan(spec("в 23:00 напомни выпить таблетку"))         # разовое, 26.11
+    planner.add_plan(spec("каждый день в 9:00 напомни про планёрку"))
+    planner.add_plan(spec("в 23:00 сверни все окна"))                 # команда, 26.11
+    got = planner.due(datetime(2026, 11, 27, 1, 30))                  # ПК спал: опоздание 2,5 ч, через полночь
+    assert [(g["text"], g.get("late_min")) for g in got] == [("выпить таблетку", 150)]
+    assert all("таблетку" not in d and "сверни" not in d for d in planner.list_plans())   # команда — пропуск, как раньше
+    assert [(g["text"], g["late_min"]) for g in planner.due(datetime(2026, 11, 27, 14, 0))] == [("про планёрку", 300)]
+    assert planner.due(datetime(2026, 11, 27, 14, 1)) == []                                 # второй раз за день — нет
+    assert planner.due(datetime(2026, 11, 28, 15, 30)) == []                                # больше 6 ч — пропуск
+    on_time = planner.due(datetime(2026, 11, 29, 9, 5))
+    assert on_time[0]["text"] == "про планёрку" and "late_min" not in on_time[0]            # 5 минут — без пометки
+    assert scenarios.reminder_phrase("выпить таблетку", 150) == "Опоздала на 2 часа 30 минут. Напоминаю: выпить таблетку."
+    assert scenarios.reminder_phrase("про планёрку", 21) == "Опоздала на 21 минуту. Напоминаю про планёрку."
+    assert scenarios.reminder_phrase("про планёрку") == "Напоминаю про планёрку."
+
+
 def test_planner_delete_and_limits(planner):
     for h in (9, 10, 11):
         planner.add_plan(spec(f"каждый день в {h}:00 скажи привет"))

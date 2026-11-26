@@ -22,6 +22,7 @@ from datetime import datetime, timedelta
 MAX_STEPS = 20
 MAX_PLANS = 50
 GRACE_SEC = 600
+REMIND_LATE_SEC = 6 * 3600     # напоминание, проспанное ПК, ещё скажем — с пометкой «опоздала на …» (команды — нет)
 
 _DAY_STEMS = [("понедельник", 0), ("вторник", 1), ("сред", 2), ("четверг", 3), ("пятниц", 4), ("суббот", 5), ("воскресень", 6)]
 _DAY_NAMES = ["понедельник", "вторник", "среда", "четверг", "пятница", "суббота", "воскресенье"]
@@ -258,9 +259,29 @@ def parse_plan(text, now=None):
             "time": f"{hh:02d}:{mm:02d}", "kind": kind, "text": rest}
 
 
-def reminder_phrase(text):
+def _plural(n, one, few, many):
+    n = abs(int(n))
+    if n % 10 == 1 and n % 100 != 11:
+        return one
+    if 2 <= n % 10 <= 4 and not 12 <= n % 100 <= 14:
+        return few
+    return many
+
+
+def _late_text(minutes):
+    """150 → «2 часа 30 минут», 21 → «21 минуту» (после «опоздала на»)."""
+    h, m = divmod(int(minutes), 60)
+    parts = [f"{h} {_plural(h, 'час', 'часа', 'часов')}"] if h else []
+    if m or not h:
+        parts.append(f"{m} {_plural(m, 'минуту', 'минуты', 'минут')}")
+    return " ".join(parts)
+
+
+def reminder_phrase(text, late_min=None):
+    """«Напоминаю: …». late_min — на сколько минут опоздала (ПК спал или был выключен) — тогда «Опоздала на …» впереди."""
     t = (text or "").strip().rstrip(".")
-    return f"Напоминаю {t}." if re.match(r"^(?:про|о|об|насчёт|насчет)\s", t) else f"Напоминаю: {t}."
+    phrase = f"Напоминаю {t}." if re.match(r"^(?:про|о|об|насчёт|насчет)\s", t) else f"Напоминаю: {t}."
+    return f"Опоздала на {_late_text(late_min)}. {phrase}" if late_min else phrase
 
 
 def describe_plan(p):
@@ -485,7 +506,9 @@ class Planner:
             return k
 
     def due(self, now=None):
-        """Задания, которым пора сработать. Помечает их выполненными, разовые удаляет, протухшие разовые тоже."""
+        """Задания, которым пора сработать. Помечает их выполненными, разовые удаляет, протухшие разовые тоже.
+        Команда срабатывает с опозданием не больше GRACE_SEC, иначе пропускается. Напоминание (kind="remind") — с
+        опозданием до REMIND_LATE_SEC (ПК спал или был выключен); тогда в задании поле late_min (минуты опоздания)."""
         now = now or datetime.now()
         today = now.date().isoformat()
         out = []
@@ -495,6 +518,7 @@ class Planner:
                 hh, mm = map(int, p["time"].split(":"))
                 due_dt = datetime.combine(now.date(), datetime.min.time()).replace(hour=hh, minute=mm)
                 once = p["days"] is None
+                remind = p.get("kind") == "remind"
                 if once:
                     try:
                         d = datetime.strptime(p["date"], "%Y-%m-%d").date()
@@ -502,11 +526,16 @@ class Planner:
                         self.plans.remove(p)
                         changed = True
                         continue
-                    if d < now.date():
+                    if remind:
+                        # от своей даты: напоминание на 23:30, а ПК проснулся в 00:40 — опоздание, а не «дата прошла»
+                        due_dt = datetime.combine(d, datetime.min.time()).replace(hour=hh, minute=mm)
+                        applies = True
+                    elif d < now.date():
                         self.plans.remove(p)
                         changed = True
                         continue
-                    applies = d == now.date()
+                    else:
+                        applies = d == now.date()
                 else:
                     applies = now.weekday() in (p["days"] or [])
                 if not applies:
@@ -514,7 +543,7 @@ class Planner:
                 late = (now - due_dt).total_seconds()
                 if late < 0:
                     continue
-                if late > GRACE_SEC:
+                if late > (REMIND_LATE_SEC if remind else GRACE_SEC):
                     if once:
                         self.plans.remove(p)
                         changed = True
@@ -523,7 +552,10 @@ class Planner:
                     continue
                 p["last"] = today
                 changed = True
-                out.append(dict(p))
+                item = dict(p)
+                if remind and late > GRACE_SEC:
+                    item["late_min"] = int(late // 60)
+                out.append(item)
                 if once:
                     self.plans.remove(p)
             if changed:
